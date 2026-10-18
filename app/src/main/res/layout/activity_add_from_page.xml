@@ -20,7 +20,8 @@
             android:id="@+id/toolbar"
             android:layout_width="match_parent"
             android:layout_height="?attr/actionBarSize"
-            app:title="Add from page"
+            app:layout_scrollFlags="scroll|enterAlways"
+            app:title="Bulk import"
             app:titleTextColor="?android:attr/textColorPrimary" />
 
         <LinearLayout
@@ -28,6 +29,7 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:padding="16dp"
+            app:layout_scrollFlags="scroll|enterAlways"
             android:background="?android:attr/windowBackground">
 
             <com.google.android.material.textfield.TextInputLayout
@@ -59,7 +61,8 @@
                     android:id="@+id/checkNormalize"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Normalize URLs" />
+                    android:text="Normalize URLs"
+                    android:checked="true" />
 
                 <View
                     android:layout_width="0dp"
@@ -83,6 +86,26 @@
                     style="@style/Widget.Material3Expressive.Button.ElevatedButton" />
             </LinearLayout>
 
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonImportFile"
+                    style="@style/Widget.Material3Expressive.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Import URL file" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonPasteUrls"
+                    style="@style/Widget.Material3Expressive.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Paste URL list" />
+            </LinearLayout>
+
             <TextView
                 android:id="@+id/textStatus"
                 android:layout_width="match_parent"
@@ -91,16 +114,6 @@
                 android:textColor="?android:attr/textColorSecondary"
                 android:layout_marginTop="4dp"
                 android:visibility="gone" />
-        </LinearLayout>
-    </com.google.android.material.appbar.AppBarLayout>
-
-    <LinearLayout
-        android:id="@+id/contentContainer"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:orientation="vertical"
-        app:layout_behavior="com.google.android.material.appbar.AppBarLayout$ScrollingViewBehavior">
-
         <TextView
             android:id="@+id/textSeriesInfo"
             android:layout_width="match_parent"
@@ -115,43 +128,67 @@
             android:id="@+id/selectionBar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
+            android:orientation="vertical"
             android:padding="8dp"
             android:gravity="center_vertical"
             android:visibility="gone">
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/buttonSelectAll"
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Select all"
-                style="@style/Widget.Material3Expressive.Button.TextButton" />
-
-            <Space
-                android:layout_width="12dp"
-                android:layout_height="0dp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/buttonSelectNone"
-                android:layout_width="0dp"
+                android:orientation="horizontal">
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonSelectAll"
+                    style="@style/Widget.Material3Expressive.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Select all" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonSelectNone"
+                    style="@style/Widget.Material3Expressive.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Select none" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonSkipExisting"
+                    style="@style/Widget.Material3Expressive.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Skip existing" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Select none"
-                style="@style/Widget.Material3Expressive.Button.TextButton" />
-
-            <Space
-                android:layout_width="12dp"
-                android:layout_height="0dp" />
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/buttonDownloadSelected"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Download selected"
-                style="@style/Widget.Material3Expressive.Button.ElevatedButton" />
+                android:orientation="horizontal">
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonDownloadSelected"
+                    style="@style/Widget.Material3Expressive.Button.ElevatedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Download new" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonUpdateExisting"
+                    style="@style/Widget.Material3Expressive.Button.ElevatedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Update existing" />
+            </LinearLayout>
         </LinearLayout>
+
+        </LinearLayout>
+    </com.google.android.material.appbar.AppBarLayout>
+
+    <LinearLayout
+        android:id="@+id/contentContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        app:layout_behavior="com.google.android.material.appbar.AppBarLayout$ScrollingViewBehavior">
 
         <FrameLayout
             android:layout_width="match_parent"

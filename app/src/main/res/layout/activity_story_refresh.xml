@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+    <com.google.android.material.appbar.AppBarLayout
+        android:id="@+id/appBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+        <com.google.android.material.appbar.MaterialToolbar
+            android:id="@+id/toolbar"
+            android:layout_width="match_parent"
+            android:layout_height="?attr/actionBarSize"
+            app:title="Refresh from story site"
+            app:navigationIcon="@drawable/ic_arrow_back_24"
+            app:navigationIconTint="?attr/colorOnSurfaceVariant" />
+    </com.google.android.material.appbar.AppBarLayout>
+    <ScrollView
+        android:id="@+id/contentScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Refresh metadata from the original fanfiction site, not book catalogues. Nothing is applied automatically. All fields start unchecked so your manual edits stay protected. Chapters, title page and table of contents remain unchanged."
+                android:textAppearance="?attr/textAppearanceBodyMedium" />
+            <TextView
+                android:id="@+id/storySource"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textIsSelectable="true" />
+            <ProgressBar
+                android:id="@+id/storyRefreshProgress"
+                style="?android:attr/progressBarStyleSmall"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:visibility="gone" />
+            <TextView
+                android:id="@+id/storyRefreshStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginVertical="12dp"
+                android:textIsSelectable="true" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonRefetchStory"
+                style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Fetch metadata again" />
+            <LinearLayout
+                android:id="@+id/storyFields"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonFetchStoryCover"
+                style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Fetch site cover" />
+            <TextView
+                android:id="@+id/storyCoverStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginVertical="12dp"
+                android:text="Cover not fetched" />
+            <ImageView
+                android:id="@+id/storyCoverImage"
+                android:layout_width="match_parent"
+                android:layout_height="240dp"
+                android:scaleType="fitCenter"
+                android:contentDescription="Original story-site cover preview"
+                android:visibility="gone" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonApplyStoryMetadata"
+                style="@style/Widget.Material3Expressive.Button.ElevatedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Apply selected metadata"
+                android:enabled="false" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonApplyStoryCover"
+                style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Apply cover only"
+                android:enabled="false" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonApplyStoryBoth"
+                style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Apply selected + cover"
+                android:enabled="false" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonStoryDone"
+                style="@style/Widget.Material3Expressive.Button.TextButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Close without applying" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

@@ -36,12 +36,14 @@ object StorageBridge {
             if (path.startsWith("content://")) {
                 val uri = Uri.parse(path)
                 val resolver = context.contentResolver
-                val deleted = resolver.delete(uri, null)
-                try {
-                    DocumentFile.fromSingleUri(context, uri)?.delete()
-                } catch (ignored: Exception) {
+                if (DocumentsContract.isDocumentUri(context, uri)) {
+                    // SAF document providers require deleteDocument, not a second delete
+                    // after resolver deletion. DocumentFile supports our full API range.
+                    DocumentFile.fromSingleUri(context, uri)?.delete() == true
+                } else {
+                    // This overload is available before API 30 as well as on Android 17.
+                    resolver.delete(uri, null, null) > 0
                 }
-                deleted > 0
             } else {
                 File(path).delete()
             }

@@ -48,6 +48,7 @@
         <activity android:name=".EditMetadataActivity"
             android:windowSoftInputMode="adjustResize" />
         <activity android:name=".MetadataPreviewActivity" />
+        <activity android:name=".StoryRefreshActivity" android:exported="false" />
         <activity android:name=".SettingsActivity"
             android:windowSoftInputMode="adjustResize" />
         <activity android:name=".DiagnosticsActivity" />

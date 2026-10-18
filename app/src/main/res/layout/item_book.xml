@@ -77,6 +77,19 @@
             app:layout_constraintTop_toBottomOf="@id/textAuthor"
             android:layout_marginTop="4dp" />
 
+        <TextView
+            android:id="@+id/textLibraryStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="@string/library_status_loading"
+            android:textSize="@dimen/m3_label_small"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toEndOf="@id/dividerCover"
+            app:layout_constraintTop_toBottomOf="@id/textChapters"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="4dp" />
+
     </androidx.constraintlayout.widget.ConstraintLayout>
 
 </com.google.android.material.card.MaterialCardView>

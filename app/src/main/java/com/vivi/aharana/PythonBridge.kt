@@ -70,6 +70,9 @@ class PythonBridge(private val context: Context) {
     fun clearDownloadDebug(): String =
         safeCall("clear_download_debug")
 
+    fun parseStoryUrlText(text: String, normalize: Boolean = true): String =
+        safeCall("parse_story_url_text", text, normalize)
+
     fun listStoryUrls(pageUrl: String, normalize: Boolean = false): String =
         safeCall("list_story_urls", pageUrl, normalize)
 
@@ -157,6 +160,19 @@ class PythonBridge(private val context: Context) {
         // All args passed explicitly (null → Python None via safeCall's Any? vararg)
         return safeCall("apply_metadata_and_cover", epubPath, fieldsJson, imageDataBase64 ?: "", imageMime ?: "", outputPath, backupSuffix)
     }
+
+    fun getLibraryFacets(epubPath: String): String =
+        safeCall("get_library_facets", epubPath)
+
+    fun getStoryDetails(epubPath: String): String =
+        safeCall("get_story_details", epubPath)
+
+    fun previewStoryRefresh(epubPath: String, includeCover: Boolean = false): String =
+        safeCall("preview_story_refresh", epubPath, includeCover)
+
+    fun applyStoryRefresh(epubPath: String, previewJson: String, selectedFieldsJson: String,
+                          applyCover: Boolean, outputPath: String? = null): String =
+        safeCall("apply_story_refresh", epubPath, previewJson, selectedFieldsJson, applyCover, outputPath)
 
     fun getInitError(): String? = initError
 

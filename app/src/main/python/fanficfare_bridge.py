@@ -573,9 +573,38 @@ def _get_dcsource_chaptercount(epubPath):
 
 def get_cover_from_epub(epubPath):
     try:
-        mime, data = _get_cover_img(epubPath)
+        from fanficfare.epubutils import get_cover_img
+        from cover_manager import validate_image_content
+        try:
+            # The declared OPF cover wins over retained images and ZIP order.
+            mime, data = get_cover_img(epubPath)
+        except Exception:
+            mime, data = None, None
+        if data is None:
+            # Upstream handles EPUB2 meta covers, but not EPUB3 cover-image
+            # properties or URI-escaped hrefs. Resolve those before heuristics.
+            import epub_editor
+            import posixpath
+            from urllib.parse import unquote, urlsplit
+            with zipfile.ZipFile(epubPath) as z:
+                opf = epub_editor._find_opf_path(z)
+                if opf:
+                    root = ET.fromstring(z.read(opf))
+                    cover_id = epub_editor._find_manifest_cover_item_id(root)
+                    item = next((e for e in root.iter() if e.get('id') == cover_id
+                                 and e.tag == '{%s}item' % epub_editor.OPF_NS), None)
+                    if item is not None:
+                        href = urlsplit(item.get('href', ''))
+                        if href.scheme or href.netloc:
+                            raise ValueError('Cover is not a local EPUB image.')
+                        path = posixpath.normpath(posixpath.join(
+                            posixpath.dirname(opf), unquote(href.path)))
+                        data = z.read(path)
+        if data is None:
+            mime, data = _get_cover_img(epubPath)
         if data is None:
             return json.dumps({"ok": True, "cover": ""})
+        mime = validate_image_content(data)['mime_type']
         encoded = __import__("base64").b64encode(data).decode("ascii")
         return json.dumps({
             "ok": True,
@@ -609,6 +638,10 @@ def scan_epub_dir(directory):
         books = []
         for root, dirs, files in os.walk(directory):
             for f in files:
+                # Legacy refresh backups used .epub and share the source URL.
+                # Match only the generated tempfile name, not user backup books.
+                if re.fullmatch(r'\.story-refresh-backup-[a-z0-9_]{8}\.epub', f):
+                    continue
                 if f.lower().endswith(".epub"):
                     path = os.path.join(root, f)
                     try:
@@ -817,6 +850,28 @@ def run_dns_diagnostics():
         msg = "{}: {}".format(type(e).__name__, e)
         print("[fanficfare_bridge] run_dns_diagnostics ERROR {}".format(msg))
         return json.dumps({"ok": False, "error": msg})
+
+
+def parse_story_url_text(text, normalize=True):
+    """Parse pasted story URLs locally, without fetching pages or metadata."""
+    try:
+        from bulk_urls import parse_story_url_text as parse_urls
+        return json.dumps(parse_urls(text, normalize))
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e),
+                           "exception_type": type(e).__name__,
+                           "detail": traceback.format_exc()})
+
+
+def canonical_story_urls(urls_json):
+    """Return offline identity keys for URLs, including unsupported HTTP URLs."""
+    try:
+        from bulk_urls import canonical_story_urls as canonical_urls
+        return json.dumps(canonical_urls(urls_json))
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e),
+                           "exception_type": type(e).__name__,
+                           "detail": traceback.format_exc()})
 
 
 def _dedupe_urls(urls):
@@ -1282,3 +1337,47 @@ def apply_metadata_and_cover(epub_path, fields_json, image_data_base64=None,
         })
     except Exception as e:
         return json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+
+
+def preview_story_refresh(epub_path, include_cover=False):
+    """Preview original-site metadata/cover without downloading chapter content."""
+    try:
+        import story_refresh
+        return json.dumps(story_refresh.preview_story_refresh(epub_path, include_cover))
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": "Story refresh preview failed.",
+                           "exception_type": type(exc).__name__,
+                           "detail": "The refresh preview could not be processed."})
+
+
+def apply_story_refresh(epub_path, preview_json, selected_fields_json='[]',
+                        apply_cover=False, output_path=None):
+    """Apply only selected original-site preview values, without network access."""
+    try:
+        import story_refresh
+        return json.dumps(story_refresh.apply_story_refresh(
+            epub_path, preview_json, selected_fields_json, apply_cover, output_path))
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": "Story refresh apply failed.",
+                           "exception_type": type(exc).__name__,
+                           "detail": "The refresh selection could not be applied."})
+
+
+def get_story_details(epub_path):
+    """Read saved story status/update date offline, including legacy FFF tags."""
+    try:
+        from story_metadata import read_story_details
+        return json.dumps(read_story_details(epub_path))
+    except Exception:
+        return json.dumps({"ok": False, "status": "", "date_updated": "",
+                           "status_source": "unknown", "date_updated_source": "unknown",
+                           "error": "EPUB story details could not be read."})
+
+
+def get_library_facets(epub_path):
+    """Read saved library filter values offline, without modifying the EPUB."""
+    try:
+        from library_facets import get_library_facets as read_facets
+        return json.dumps(read_facets(epub_path))
+    except Exception:
+        return json.dumps({"ok": False, "error": "Saved book filters could not be read."})

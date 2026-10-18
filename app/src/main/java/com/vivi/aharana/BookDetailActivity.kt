@@ -14,6 +14,11 @@ import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 
@@ -24,6 +29,7 @@ class BookDetailActivity : BaseActivity() {
         const val EDIT_METADATA_REQUEST = 1001
         const val REPLACE_COVER_REQUEST = 1002
         const val PREVIEW_METADATA_REQUEST = 1003
+        const val STORY_REFRESH_REQUEST = 1004
     }
 
     private lateinit var bookTitle: String
@@ -89,6 +95,7 @@ class BookDetailActivity : BaseActivity() {
 
         Log.d(TAG, "ui_population_complete")
         loadCoverFromEpub(coverFile, cover)
+        loadStoryDetails()
 
         val buttonUrl = findViewById<Button>(R.id.buttonUrl)
         if (bookUrl.isBlank()) {
@@ -108,6 +115,44 @@ class BookDetailActivity : BaseActivity() {
         findViewById<Button>(R.id.buttonEditMetadata).setOnClickListener { editMetadata() }
         findViewById<Button>(R.id.buttonReplaceCover).setOnClickListener { replaceCover() }
         findViewById<Button>(R.id.buttonPreviewOnline).setOnClickListener { previewOnlineMetadata() }
+        findViewById<Button>(R.id.buttonRefreshStory).apply {
+            // The preview reads the authoritative story URL from the EPUB itself.
+            setOnClickListener {
+                startActivityForResult(Intent(this@BookDetailActivity, StoryRefreshActivity::class.java)
+                    .putExtra("epub_path", bookPath), STORY_REFRESH_REQUEST)
+            }
+        }
+    }
+
+    /** Read existing OPF/tags only. No story-site request, EPUB rewrite or library migration. */
+    private fun loadStoryDetails() {
+        val statusView = findViewById<TextView>(R.id.textStoryStatus)
+        val updatedView = findViewById<TextView>(R.id.textStoryUpdated)
+        lifecycleScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    val bridge = PythonBridge(applicationContext)
+                    val raw = StorageBridge.withLocalEpub(applicationContext, bookPath) {
+                        bridge.getStoryDetails(it.absolutePath)
+                    } ?: error("Cannot read this EPUB")
+                    JSONObject(raw).also {
+                        check(it.optBoolean("ok")) { it.optString("error", "Cannot read story metadata") }
+                    }
+                }
+                fun value(key: String): String = if (result.isNull(key)) "" else result.optString(key).trim()
+                statusView.text = value("status").takeIf { it.isNotBlank() }?.let {
+                    "Status: $it" } ?: "Status: Not stored"
+                updatedView.text = value("date_updated").takeIf { it.isNotBlank() }?.let {
+                    "Story updated: $it" } ?: "Story updated: Not stored"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                statusView.text = "Status: Unavailable"
+                updatedView.text = "Story updated: Unavailable"
+                DiagnosticLog.appendException(applicationContext, "Detail.StoryMetadata", "read_failed", e)
+                showMessage("Cannot read saved story details: ${e.message}")
+            }
+        }
     }
 
     private fun loadCoverFromEpub(epubFile: File, coverView: ImageView) {
@@ -467,6 +512,13 @@ class BookDetailActivity : BaseActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
+            STORY_REFRESH_REQUEST -> {
+                if (resultCode == RESULT_OK && data != null) {
+                    // The refresh store already persisted the exact library row including cover.
+                    setResult(RESULT_OK, Intent(data).putExtra("story_refreshed", true))
+                    finish()
+                }
+            }
             EDIT_METADATA_REQUEST, PREVIEW_METADATA_REQUEST -> {
                 if (resultCode == RESULT_OK) {
                     val title = data?.getStringExtra("title") ?: bookTitle

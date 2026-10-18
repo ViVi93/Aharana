@@ -53,6 +53,18 @@
             android:textColor="?attr/colorPrimary"
             android:visibility="gone" />
 
+        <TextView
+            android:id="@+id/libraryFilterSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="6dp"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:clickable="false"
+            android:visibility="gone" />
+
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
@@ -81,6 +93,7 @@
                 android:alpha="0.6" />
 
             <TextView
+                android:id="@+id/textEmptyLibraryTitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="16dp"
@@ -90,6 +103,7 @@
                 android:gravity="center" />
 
             <TextView
+                android:id="@+id/textEmptyLibrarySubtitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"

@@ -8,6 +8,9 @@ import androidx.lifecycle.viewModelScope
 import com.vivi.aharana.data.local.DownloadJobEntity
 import com.vivi.aharana.model.BookItem
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import androidx.lifecycle.Observer
 
 class JobUiState(
     val jobId: Long = 0,
@@ -38,6 +41,36 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
     private var _sortDirection = true
     private val _sortDirectionLive = MutableLiveData<Boolean>(true)
     val sortDirection: LiveData<Boolean> = _sortDirectionLive
+
+    private var facetLoader: LibraryFacetLoader? = null
+    private var restoreFiltersJob: Job? = null
+    private var reconcileJob: Job? = null
+    private val libraryReady = kotlinx.coroutines.CompletableDeferred<Unit>()
+    private var filtersRestored = false
+    private var userChoseFilters = false
+    val filterProgress = MutableLiveData("")
+    val filterError = MutableLiveData("")
+    private val filterState by lazy {
+        LibraryFilterState(viewModelScope, repository::getBooksSnapshot, ::signature,
+            read = { book: BookItem -> checkNotNull(facetLoader).read(book) },
+            onChanged = { recomputeVisible() },
+            onProgress = { filterProgress.value = it },
+            onError = { filterError.value = it },
+            persistSelection = { checkNotNull(facetLoader).saveSelection(it) },
+            readFresh = { book: BookItem -> checkNotNull(facetLoader).read(book, force = true) },
+            loadCached = { rows -> checkNotNull(facetLoader).cached(rows) },
+            identity = { it.uriString })
+    }
+    val filterReadFailures: Int get() = filterState.failures
+    private val booksObserver = Observer<List<BookItem>> { books ->
+        recomputeVisible(books)
+        filterState.booksChanged()
+        if (filtersRestored) facetLoader?.let { loader ->
+            loader.setMembership(books)
+            reconcileJob?.cancel()
+            reconcileJob = viewModelScope.launch { loader.reconcile() }
+        }
+    }
 
     init {
         repository.getSavedSort()?.let { _currentSort.value = it }
@@ -79,9 +112,7 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
                 )
             }
         }
-        repository.books.observeForever { books ->
-            _visibleBooks.value = sorted(books)
-        }
+        repository.books.observeForever(booksObserver)
     }
 
     private var _lastNotifiedTerminalJobId: Long? = null
@@ -93,9 +124,7 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
         _currentSort.value = sort
         repository.setSavedSort(sort)
         repository.setSavedSortDirection(_sortDirection)
-        val sorted = sorted(repository.getBooks().toList())
-        repository.setBooks(sorted)
-        recomputeVisible(sorted)
+        recomputeVisible() // Sorting is a projection, never a Room rewrite.
     }
 
     fun setSearchQuery(query: String?) {
@@ -132,18 +161,90 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
     }
 
     fun recomputeVisible(books: List<BookItem> = repository.getBooks().toList()) {
+        _visibleBooks.value = projectLibrary(books)
+    }
+
+    fun projectLibrary(books: List<BookItem>): List<BookItem> {
+        if (!filtersRestored) return emptyList() // Do not flash an unfiltered list during saved-choice restore.
+        val selection = filterState.selection
+        // While refreshing, retain the previous coherent book/index pair. Never
+        // interpret a newly added/unscanned book as a negative filter match.
+        val existingPaths = repository.getBooksSnapshot().mapTo(hashSetOf()) { it.uriString }
+        val base = if (selection.isEmpty()) books else filterState.indexedBooks.filter { it.uriString in existingPaths }
         val q = _searchQuery.value
-        val source = if (q.isNullOrBlank()) books else {
+        val source = if (q.isNullOrBlank()) base else {
             val query = q.trim().lowercase()
-            books.filter { it.title.lowercase().contains(query) || it.author.lowercase().contains(query) }
+            base.filter { it.title.lowercase().contains(query) || it.author.lowercase().contains(query) }
         }
-        _visibleBooks.value = sorted(source)
+        val filtered = if (selection.isEmpty()) source else source.filter { book ->
+            filterState.records[book.uriString]?.let { LibraryFilters.matches(it, selection) } == true
+        }
+        return sorted(filtered)
+    }
+
+    fun configureFilters(context: android.content.Context) {
+        if (facetLoader != null) return
+        val loader = LibraryFacetLoader.shared(context.applicationContext)
+        facetLoader = loader
+        val restore = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            filterProgress.value = "Loading saved library…"
+            try {
+                libraryReady.await() // An initially empty LiveData is not a loaded empty library.
+                val saved = loader.readSelection()
+                if (!userChoseFilters) filterState.restore(saved)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: Exception) { filterError.value = "Saved filters could not be restored. Open Filter library to choose them again." }
+            finally {
+                filtersRestored = true
+                filterProgress.value = if (filterState.selection.isNotEmpty() && !filterState.isFresh())
+                    "Preparing library…" else ""
+                recomputeVisible()
+            }
+            // Publish cached results first. Source stats and missing/changed metadata happen later.
+            kotlinx.coroutines.yield()
+            loader.setMembership(repository.getBooksSnapshot())
+            loader.reconcile()
+            filterState.validateInBackground()
+        }
+        restoreFiltersJob = restore
+        restore.start()
+    }
+
+    fun getLibraryFilters(): Map<String, Set<String>> = filterState.selection.mapValues { it.value.toSet() }
+
+    fun setLibraryFilters(selection: Map<String, Set<String>>) {
+        userChoseFilters = true
+        filterError.value = ""
+        filterState.apply(selection)
+    }
+
+    fun filterOptions(key: String): Map<String, Int> = LibraryFilters.options(filterState.records.values, key)
+    fun filterIndexReady(): Boolean = filtersRestored && filterState.isFresh()
+    fun isRestoringLibrary(): Boolean = !filtersRestored
+
+    private fun signature(books: List<BookItem>): List<String> = books.map(LibraryFacetLoader::bookSignature).sorted()
+
+    suspend fun prepareFilterIndex(force: Boolean = false) {
+        checkNotNull(facetLoader) { "Filters are not initialized" }
+        restoreFiltersJob?.join()
+        filterState.prepare(force)
+    }
+
+    override fun onCleared() {
+        repository.books.removeObserver(booksObserver)
+        super.onCleared()
     }
 
     fun loadLibrary(): Boolean {
         var ok = false
         viewModelScope.launch {
-            ok = repository.loadLibrary()
+            try {
+                ok = repository.loadLibrary()
+                libraryReady.complete(Unit)
+            } catch (e: Exception) {
+                libraryReady.completeExceptionally(e)
+                throw e
+            }
             if (ok) {
                 val sort = _currentSort.value ?: "modified"
                 setSort(sort)
@@ -161,6 +262,7 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
      */
     suspend fun reloadFromStore(): Boolean {
         val ok = repository.loadLibrary()
+        libraryReady.complete(Unit)
         if (ok) {
             setSort(_currentSort.value ?: "modified")
         }

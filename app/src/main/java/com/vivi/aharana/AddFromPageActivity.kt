@@ -2,21 +2,23 @@ package com.vivi.aharana
 
 import android.content.Intent
 import android.os.Bundle
-import android.util.Log
+import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.TextView
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.vivi.aharana.ViewModelFactory
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -25,109 +27,144 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import kotlinx.coroutines.delay
 
+/** Page discovery, local file import and pasted lists share one persisted preview. */
 class AddFromPageActivity : BaseActivity() {
+    companion object {
+        private const val MAX_INPUT_BYTES = 1024 * 1024
+    }
 
     private lateinit var inputUrl: TextInputEditText
     private lateinit var checkNormalize: MaterialCheckBox
     private lateinit var buttonFetch: MaterialButton
+    private lateinit var buttonImportFile: MaterialButton
+    private lateinit var buttonPasteUrls: MaterialButton
+    private lateinit var buttonDownloadSelected: MaterialButton
+    private lateinit var buttonUpdateExisting: MaterialButton
+    private lateinit var buttonSkipExisting: MaterialButton
     private lateinit var progressBar: ProgressBar
     private lateinit var textStatus: TextView
     private lateinit var textSeriesInfo: TextView
-    private lateinit var recycler: RecyclerView
     private lateinit var textEmpty: TextView
-    private lateinit var buttonSelectAll: MaterialButton
-    private lateinit var buttonSelectNone: MaterialButton
-    private lateinit var buttonDownloadSelected: MaterialButton
-
-    private val adapter = StoryCheckAdapter()
-    private var pythonBridge: com.vivi.aharana.PythonBridge? = null
-    private var metadataJob: Job? = null
-    private var fetchJob: Job? = null
+    private lateinit var repository: BookRepository
     private lateinit var viewModel: LibraryViewModel
+    private var pythonBridge: PythonBridge? = null
+    private var fetchJob: Job? = null
+    private var metadataJob: Job? = null
+    private var previewJob: Job? = null
+    private var busy = false
+    private var sourceLabel = ""
+    private var metadataPaused = false
+    private val adapter = StoryCheckAdapter()
+    private val previewPrefs by lazy { getSharedPreferences("bulk_import", MODE_PRIVATE) }
+
+    private val filePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            fetchJob?.cancel()
+            fetchJob = lifecycleScope.launch {
+                setLoading(true)
+                try {
+                    val text = withContext(Dispatchers.IO) {
+                        val bytes = contentResolver.openInputStream(uri)?.use { stream ->
+                            val buffer = ByteArray(MAX_INPUT_BYTES + 1)
+                            var used = 0
+                            while (used < buffer.size) {
+                                val count = stream.read(buffer, used, buffer.size - used)
+                                if (count < 0) break
+                                if (count == 0) error("File provider returned no data")
+                                used += count
+                            }
+                            buffer.copyOf(used)
+                        } ?: error("Cannot read the selected file")
+                        require(bytes.size <= MAX_INPUT_BYTES) { "URL list exceeds 1 MiB" }
+                        Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+                    }
+                    parseUrlText(text)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    status("Import failed: ${e.message}")
+                    showMessage("Import failed: ${e.message}")
+                } finally {
+                    setLoading(false)
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        DiagnosticLog.append(this, "AddFromPage", "onCreate intent=${intent?.action}")
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_add_from_page)
-        applyTopInset(findViewById<android.view.View>(R.id.appBar))
-        applyBottomInset(findViewById<android.view.View>(R.id.recyclerStories))
-
+        applyTopInset(findViewById(R.id.appBar))
+        applyBottomInset(findViewById(R.id.recyclerStories))
         val toolbar = findViewById<androidx.appcompat.widget.Toolbar>(R.id.toolbar)
         setSupportActionBar(toolbar)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
-
-        if (!com.chaquo.python.Python.isStarted()) {
-            try {
-                com.chaquo.python.Python.start(com.chaquo.python.android.AndroidPlatform(this))
-            } catch (e: Exception) {
-                DiagnosticLog.append(this, "AddFromPage", "python_start_failed=${e.message}")
-            }
-        }
-
-        pythonBridge = com.vivi.aharana.PythonBridge(this)
-        pythonBridge?.initialize(com.vivi.aharana.SettingsActivity.getConfigDir(this).absolutePath)
-
-        val repository = BookRepository(this)
-        viewModel = ViewModelProvider(this, ViewModelFactory(repository))[LibraryViewModel::class.java]
-
         inputUrl = findViewById(R.id.inputUrl)
         checkNormalize = findViewById(R.id.checkNormalize)
         buttonFetch = findViewById(R.id.buttonFetch)
+        buttonImportFile = findViewById(R.id.buttonImportFile)
+        buttonPasteUrls = findViewById(R.id.buttonPasteUrls)
+        buttonDownloadSelected = findViewById(R.id.buttonDownloadSelected)
+        buttonUpdateExisting = findViewById(R.id.buttonUpdateExisting)
+        buttonSkipExisting = findViewById(R.id.buttonSkipExisting)
         progressBar = findViewById(R.id.progressBar)
         textStatus = findViewById(R.id.textStatus)
         textSeriesInfo = findViewById(R.id.textSeriesInfo)
-        recycler = findViewById(R.id.recyclerStories)
         textEmpty = findViewById(R.id.textEmpty)
-        buttonSelectAll = findViewById(R.id.buttonSelectAll)
-        buttonSelectNone = findViewById(R.id.buttonSelectNone)
-        buttonDownloadSelected = findViewById(R.id.buttonDownloadSelected)
-
-        recycler.layoutManager = LinearLayoutManager(this)
-        recycler.adapter = adapter
-
-        val shared = intent?.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
-        if (shared.isNotBlank()) {
-            inputUrl.setText(shared)
+        findViewById<RecyclerView>(R.id.recyclerStories).apply {
+            layoutManager = LinearLayoutManager(this@AddFromPageActivity)
+            adapter = this@AddFromPageActivity.adapter
         }
-
-        val persisted = loadPersistedAddFromPageItems()
-        if (persisted != null) {
-            val (pageUrl, normalize, items) = persisted
-            inputUrl.setText(pageUrl)
-            checkNormalize.isChecked = normalize
-            adapter.submitList(items)
-            updateActions()
-            if (items.any { it.title.isBlank() }) {
-                startLazyMetadata(items)
+        try {
+            if (!com.chaquo.python.Python.isStarted()) {
+                com.chaquo.python.Python.start(com.chaquo.python.android.AndroidPlatform(this))
             }
+            pythonBridge = PythonBridge(this).also {
+                it.initialize(SettingsActivity.getConfigDir(this).absolutePath)
+            }
+        } catch (e: Exception) {
+            DiagnosticLog.appendException(this, "BulkImport", "bridge_init_failed", e)
+            status("Python unavailable: ${e.message}")
         }
-
+        repository = BookRepository(this)
+        viewModel = ViewModelProvider(this, ViewModelFactory(repository))[LibraryViewModel::class.java]
+        restorePreviewState()
+        intent?.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotBlank() }?.let {
+            inputUrl.setText(it)
+        }
         buttonFetch.setOnClickListener {
-            val url = inputUrl.text.toString().trim()
-            if (url.isBlank()) {
-                toast("Enter a page URL")
-                return@setOnClickListener
+            val page = inputUrl.text.toString().trim()
+            if (page.isBlank()) showMessage("Enter a page URL or use Paste URL list")
+            else fetchStoryList(page, checkNormalize.isChecked)
+        }
+        buttonImportFile.setOnClickListener {
+            try {
+                filePicker.launch(arrayOf("text/*", "application/octet-stream"))
+            } catch (e: Exception) {
+                showMessage("Cannot open file picker: ${e.message}")
             }
-            fetchStoryList(url, checkNormalize.isChecked)
         }
-
-        buttonSelectAll.setOnClickListener {
-            val updated = adapter.currentList.map { it.copy(checked = true) }
-            adapter.submitList(updated)
+        buttonPasteUrls.setOnClickListener { showPasteUrlsDialog() }
+        findViewById<MaterialButton>(R.id.buttonSelectAll).setOnClickListener {
+            adapter.submitList(adapter.currentList.map { it.copy(checked = it.state != "queued") })
+            savePreviewState()
         }
-
-        buttonSelectNone.setOnClickListener {
-            val updated = adapter.currentList.map { it.copy(checked = false) }
-            adapter.submitList(updated)
+        findViewById<MaterialButton>(R.id.buttonSelectNone).setOnClickListener {
+            adapter.submitList(adapter.currentList.map { it.copy(checked = false) })
+            savePreviewState()
         }
-
-        buttonDownloadSelected.setOnClickListener {
-            downloadSelected()
+        buttonSkipExisting.setOnClickListener { skipExisting() }
+        buttonDownloadSelected.setOnClickListener { queueSelected("new") }
+        buttonUpdateExisting.setOnClickListener { queueSelected("update") }
+        viewModel.latestJobs.observe(this) { jobs ->
+            applyMetadataResults(jobs)
+            refreshLibraryStates()
         }
-
+        repository.books.observe(this) { refreshLibraryStates() }
+        checkNormalize.setOnCheckedChangeListener { _, _ -> savePreviewState() }
         updateActions()
+        if (adapter.currentList.isNotEmpty()) startLazyMetadata()
     }
 
     override fun onCreateOptionsMenu(menu: android.view.Menu?): Boolean {
@@ -135,606 +172,363 @@ class AddFromPageActivity : BaseActivity() {
         return true
     }
 
-    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
-        return when (item.itemId) {
-            R.id.action_cancel_metadata -> {
-                cancelMetadataFetch()
-                true
-            }
-            R.id.action_clear_saved -> {
-                clearPersistedAddFromPageItems()
-                toast("Cleared saved entries")
-                true
-            }
-            else -> super.onOptionsItemSelected(item)
+    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean = when (item.itemId) {
+        R.id.action_cancel_metadata -> {
+            metadataPaused = true
+            metadataJob?.cancel()
+            repository.cancelBulkMetadata()
+            savePreviewState()
+            status("Metadata fetch cancelled; import/fetch again to retry")
+            true
         }
-    }
-
-    private fun cancelMetadataFetch() {
-        metadataJob?.cancel()
-        metadataJob = null
-        try {
-            androidx.work.WorkManager.getInstance(this)
-                .cancelAllWorkByTag("fanficfare_metadata")
-        } catch (e: Exception) {
-            android.util.Log.e("AddFromPage", "cancel_metadata_failed", e)
-        }
-        textStatus.text = "Ready"
-        try {
-            val repository = BookRepository(this)
-            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                try {
-                    val now = System.currentTimeMillis()
-                    repository.getAllDownloadJobs()
-                        .filter { it.type == "metadata" && setOf("running", "queued", FanFicFareWorker.STATUS_WAITING).contains(it.status) }
-                        .forEach { job ->
-                            repository.updateDownloadJobStatus(job.id, "cancelled", now)
-                        }
-                } catch (e: Exception) {
-                    android.util.Log.e("AddFromPage", "cancel_metadata_db_update_failed", e)
-                }
+        R.id.action_clear_saved -> {
+            if (!busy) {
+                metadataJob?.cancel()
+                previewJob?.cancel()
+                adapter.submitList(emptyList())
+                inputUrl.setText("")
+                sourceLabel = ""
+                previewPrefs.edit().remove("state").apply()
+                // Remove legacy state as well, otherwise it would be migrated again.
+                File(filesDir, "add_from_page/add_from_page_items.json").delete()
+                textSeriesInfo.visibility = View.GONE
+                status("Cleared saved entries")
+                updateActions()
             }
-        } catch (e: Exception) {
-            android.util.Log.e("AddFromPage", "cancel_metadata_scope_failed", e)
+            true
         }
+        else -> super.onOptionsItemSelected(item)
     }
 
-    override fun onSupportNavigateUp(): Boolean {
-        finish()
-        return true
-    }
-
-    override fun onStart() {
-        super.onStart()
-        DiagnosticLog.append(this, "AddFromPage", "onStart")
-    }
-
-    override fun onResume() {
-        super.onResume()
-        DiagnosticLog.append(this, "AddFromPage", "onResume")
-    }
+    override fun onSupportNavigateUp(): Boolean { finish(); return true }
 
     override fun onPause() {
+        savePreviewState()
         super.onPause()
-        DiagnosticLog.append(this, "AddFromPage", "onPause isFinishing=${isFinishing}")
-    }
-
-    override fun onStop() {
-        super.onStop()
-        DiagnosticLog.append(this, "AddFromPage", "onStop isFinishing=${isFinishing}")
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        // The preview is persisted on disk, never parcel thousands of rows into Binder.
+        savePreviewState()
         super.onSaveInstanceState(outState)
-        outState.putString("page_url", inputUrl.text.toString())
-        outState.putBoolean("normalize", checkNormalize.isChecked)
-        outState.putString("series_info", textSeriesInfo.text.toString())
-        outState.putString("status", textStatus.text.toString())
-        outState.putParcelableArrayList("items", ArrayList(adapter.currentList.map { it.toParcelable() }))
     }
 
-    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
-        super.onRestoreInstanceState(savedInstanceState)
-        inputUrl.setText(savedInstanceState.getString("page_url", ""))
-        checkNormalize.isChecked = savedInstanceState.getBoolean("normalize", false)
-        textSeriesInfo.text = savedInstanceState.getString("series_info", "")
-        textSeriesInfo.visibility = if (textSeriesInfo.text.isBlank()) View.GONE else View.VISIBLE
-        textStatus.text = savedInstanceState.getString("status", "")
-        textStatus.visibility = if (textStatus.text.isBlank()) View.GONE else View.VISIBLE
-        val saved = savedInstanceState.getParcelableArrayList<StoryItemParcel>("items")
-        if (saved != null) {
-            adapter.submitList(saved.map { it.toStoryItem() })
-        }
-        updateActions()
-    }
-
-    private fun fetchStoryList(pageUrl: String, normalize: Boolean) {
+    private fun fetchStoryList(page: String, normalize: Boolean) {
         fetchJob?.cancel()
-        metadataJob?.cancel()
-        adapter.submitList(emptyList())
-        textSeriesInfo.visibility = View.GONE
-        textSeriesInfo.text = ""
-        setLoading(true)
-        textStatus.visibility = View.VISIBLE
-        textStatus.text = "Fetching stories..."
-
-        val preFlight = runPreFlight(pageUrl)
-        if (preFlight != null) {
-            textStatus.text = preFlight
-            textStatus.visibility = View.VISIBLE
-        }
-
         fetchJob = lifecycleScope.launch {
-            val raw = withContext(Dispatchers.IO) {
-                pythonBridge?.listStoryUrls(pageUrl, normalize)
-                    ?: """{"ok":false,"error":"Bridge missing"}"""
-            }
-            val result = safeJson(raw)
-            setLoading(false)
-            if (result == null || !result.optBoolean("ok")) {
-                val error = result?.optString("error") ?: "Unknown error"
-                textStatus.text = "Failed: $error"
-                textStatus.visibility = View.VISIBLE
-                return@launch
-            }
-
-            val urls = jsonStringList(result, "urllist")
-            val seriesName = result.optString("name").ifBlank { null }
-            val seriesDesc = result.optString("desc").ifBlank { null }
-
-            if (urls.isEmpty()) {
-                textStatus.text = "No story URLs found on this page"
-                textStatus.visibility = View.VISIBLE
-                adapter.submitList(emptyList())
-                updateActions()
-                return@launch
-            }
-
-            if (seriesName != null) {
-                textSeriesInfo.text = "Series: $seriesName"
-                textSeriesInfo.visibility = View.VISIBLE
-            } else {
-                textSeriesInfo.visibility = View.GONE
-            }
-
-            textStatus.text = "Found ${urls.size} stories"
-            textStatus.visibility = View.VISIBLE
-
-            val items = urls.map { url -> StoryItem(url = url) }
-            val dedupedExact = dedupeExactUrls(items)
-            val dedupedSeries = dedupeSeriesUrls(dedupedExact)
-            val dedupedItems = dedupeChapterSlugs(dedupedSeries)
-            DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "dedupe raw=${items.size} exact=${dedupedExact.size} series=${dedupedSeries.size} chapter=${dedupedItems.size}")
-            val sampleRaw = items.take(3).joinToString(" | ") { it.url }
-            val sampleDeduped = dedupedItems.take(3).joinToString(" | ") { it.url }
-            DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "dedupe sample_raw=$sampleRaw")
-            DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "dedupe sample_deduped=$sampleDeduped")
-            adapter.submitList(dedupedItems)
-            persistAddFromPageItems(pageUrl, normalize, dedupedItems)
-            updateActions()
-            startLazyMetadata(dedupedItems)
-
-            if (!seriesDesc.isNullOrBlank()) {
-                MaterialAlertDialogBuilder(this@AddFromPageActivity)
-                    .setTitle(seriesName ?: "Series")
-                    .setMessage(seriesDesc)
-                    .setPositiveButton("OK", null)
-                    .show()
-            }
-        }
-    }
-
-    private fun startLazyMetadata(items: List<StoryItem>) {
-        metadataJob?.cancel()
-        if (items.isEmpty()) return
-        textStatus.text = "Fetching metadata..."
-
-        val urlToIndex = items.withIndex().associate { it.value.url to it.index }
-        val updated = items.toMutableList()
-        var remaining = updated.indices.toMutableSet()
-        DiagnosticLog.append(this, "AddFromPage", "startLazyMetadata urlCount=${urlToIndex.size}")
-
-        fun applyMeta(idx: Int, meta: JSONObject?) {
-            if (meta != null && meta.optBoolean("ok")) {
-                updated[idx] = updated[idx].copy(
-                    title = meta.optString("title").ifBlank { updated[idx].url },
-                    chapters = meta.optInt("chapters", 0)
-                )
-            } else {
-                updated[idx] = updated[idx].copy(title = updated[idx].url)
-            }
-            adapter.submitList(updated.toList())
-            remaining.remove(idx)
-        }
-
-        fun markComplete() {
-            val successCount = updated.count { it.title != it.url }
-            DiagnosticLog.append(this, "AddFromPage", "observer_complete successCount=$successCount total=${updated.size}")
-            textStatus.text = "Ready: $successCount/${updated.size} resolved"
-            updateActions()
-        }
-
-        metadataJob = lifecycleScope.launch {
+            setLoading(true)
+            status("Fetching stories…")
             try {
-                val existingJobs = withContext(Dispatchers.IO) { BookRepository(this@AddFromPageActivity).getAllDownloadJobs() }
-                val initialLatestByUrl = existingJobs.filter { entity ->
-                    entity.type == "metadata" && !entity.inputUrl.isNullOrBlank() &&
-                            setOf("success", "failed", "cancelled").contains(entity.status)
-                }.groupBy { it.inputUrl!! }.mapValues { entry -> entry.value.maxByOrNull { it.createdAt }!! }
-                val processedUrls = mutableSetOf<String>()
-                for ((url, entity) in initialLatestByUrl) {
-                    val idx = urlToIndex[url] ?: continue
-                    if (!remaining.contains(idx)) continue
-                    processedUrls.add(url)
-                    val meta = if (entity.status == "success" && !entity.resultJson.isNullOrBlank()) safeJson(entity.resultJson) else null
-                    applyMeta(idx, meta)
-                    DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "backfill_entity url=$url status=${entity.status}")
-                }
-                if (remaining.isEmpty()) {
-                    markComplete()
+                val result = withContext(Dispatchers.IO) { safeJson(pythonBridge?.listStoryUrls(page, normalize)) }
+                if (result == null || !result.optBoolean("ok")) {
+                    status("Fetch failed: ${result?.optString("error") ?: "Bridge unavailable"}")
                     return@launch
                 }
-
-                viewModel.latestJobs.observe(this@AddFromPageActivity,
-                    androidx.lifecycle.Observer { jobs ->
-                        if (remaining.isEmpty()) return@Observer
-                        val latestByUrl = jobs.filter { entity ->
-                            entity.type == "metadata" && !entity.inputUrl.isNullOrBlank() &&
-                                    setOf("success", "failed", "cancelled").contains(entity.status)
-                        }.groupBy { it.inputUrl!! }.mapValues { entry -> entry.value.maxByOrNull { it.createdAt }!! }
-                        var metadataSeen = 0
-                        for ((url, entity) in latestByUrl) {
-                            val idx = urlToIndex[url] ?: continue
-                            if (!remaining.contains(idx)) continue
-                            if (!processedUrls.add(url)) continue
-                            metadataSeen++
-                            DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "observer_entity url=$url status=${entity.status}")
-                            val meta = if (entity.status == "success" && !entity.resultJson.isNullOrBlank()) safeJson(entity.resultJson) else null
-                            applyMeta(idx, meta)
-                        }
-                        DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "observer_update metadataSeen=$metadataSeen remaining=${remaining.size}")
-                        if (remaining.isEmpty()) {
-                            markComplete()
-                            metadataJob?.cancel()
-                        }
-                    })
-
-                // Enqueue all remaining metadata jobs in a single batch instead of
-                // one-at-a-time in a tight loop.  The per-URL approach caused:
-                //   1. N separate DB inserts → N observer notifications for the
-                //      RecyclerView (via LibraryViewModel) → O(n²) DiffUtil churn.
-                //   2. N simultaneous WorkManager jobs spinning up Chaquopy
-                //      Python interpreters → CPU/network saturation → app
-                //      disconnects from the debugger (appears as "connection drop").
-                val remainingUrls = urlToIndex.keys.filter { url ->
-                    urlToIndex[url]?.let { remaining.contains(it) } == true &&
-                    !processedUrls.contains(url)
+                val urls = jsonStringList(result, "urllist")
+                // The same offline parser normalizes and deduplicates every input route.
+                val parsed = withContext(Dispatchers.IO) {
+                    safeJson(pythonBridge?.parseStoryUrlText(urls.joinToString("\n"), normalize))
                 }
-                if (remainingUrls.isNotEmpty()) {
-                    val repo = BookRepository(this@AddFromPageActivity)
-                    try {
-                        withContext(Dispatchers.IO) {
-                            repo.enqueueMetadataBatch(remainingUrls)
-                        }
-                        DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "batch_enqueued count=${remainingUrls.size}")
-                    } catch (e: Exception) {
-                        Log.w("AddFromPage", "enqueueMetadataBatch failed", e)
-                        DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "batch_enqueue_failed error=${e.message}")
-                        for (url in remainingUrls) {
-                            val idx = urlToIndex[url]
-                            if (idx != null && remaining.contains(idx)) {
-                                applyMeta(idx, null)
-                            }
-                        }
-                    }
+                if (parsed == null || !parsed.optBoolean("ok")) {
+                    status("Preview failed: ${parsed?.optString("error") ?: "Bridge unavailable"}")
+                    return@launch
                 }
-                DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "enqueue_complete remaining=${remaining.size}")
-                if (remaining.isEmpty()) markComplete()
+                val valid = jsonStringList(parsed, "urllist")
+                if (valid.isEmpty()) { status("No supported story URLs found on this page"); return@launch }
+                showUrlPreview(valid, "Found ${valid.size} stories", page)
+                val name = result.optString("name")
+                val desc = result.optString("desc")
+                if (name.isNotBlank()) {
+                    sourceLabel = "Series: $name"
+                    showSourceLabel()
+                    savePreviewState()
+                }
+                if (desc.isNotBlank()) MaterialAlertDialogBuilder(this@AddFromPageActivity)
+                    .setTitle(name.ifBlank { "Series" }).setMessage(desc).setPositiveButton("OK", null).show()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                Log.e("AddFromPage", "loop_failed", e)
-                DiagnosticLog.append(this@AddFromPageActivity, "AddFromPage", "loop_failed | exception=${e.javaClass.simpleName} | msg=${e.message}")
+                status("Fetch failed: ${e.message}")
+            } finally {
+                setLoading(false)
             }
         }
     }
 
-    private fun downloadSelected() {
-        val selected = adapter.currentList.filter { it.checked }
-        if (selected.isEmpty()) {
-            toast("No stories selected")
+    private fun showPasteUrlsDialog() {
+        val input = EditText(this).apply {
+            hint = "One story URL per line"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 4
+            maxLines = 8
+            gravity = android.view.Gravity.TOP
+        }
+        val dialog = MaterialAlertDialogBuilder(this).setTitle("Paste story URLs").setView(input)
+            .setNegativeButton("Cancel", null).setPositiveButton("Preview", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val text = input.text.toString()
+                when {
+                    text.isBlank() -> input.error = "Paste at least one story URL"
+                    text.toByteArray(Charsets.UTF_8).size > MAX_INPUT_BYTES -> input.error = "URL list exceeds 1 MiB"
+                    else -> {
+                        dialog.dismiss()
+                        fetchJob?.cancel()
+                        fetchJob = lifecycleScope.launch {
+                            setLoading(true)
+                            try { parseUrlText(text) } finally { setLoading(false) }
+                        }
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private suspend fun parseUrlText(text: String) {
+        val normalize = checkNormalize.isChecked
+        val result = try {
+            withContext(Dispatchers.IO) { safeJson(pythonBridge?.parseStoryUrlText(text, normalize)) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            status("Import failed: ${e.message}")
             return
         }
-        textStatus.visibility = View.VISIBLE
-        textStatus.text = "Enqueuing ${selected.size} downloads..."
-        setFetchEnabled(false)
+        if (result == null || !result.optBoolean("ok")) {
+            status("Import failed: ${result?.optString("error") ?: "Bridge unavailable"}")
+            return
+        }
+        val urls = jsonStringList(result, "urllist")
+        if (urls.isEmpty()) {
+            status("No supported story URLs found; ${result.optInt("invalid_count")} invalid entries")
+            return
+        }
+        showUrlPreview(urls, "Imported ${urls.size} stories; ${result.optInt("duplicates_removed")} duplicates removed; ${result.optInt("invalid_count")} invalid entries")
+    }
 
+    private fun showUrlPreview(urls: List<String>, summary: String, page: String = "") {
+        metadataJob?.cancel()
+        previewJob?.cancel()
+        metadataPaused = false
+        inputUrl.setText(page)
+        sourceLabel = summary
+        showSourceLabel()
+        adapter.submitList(urls.map { StoryItem(it) })
+        status(summary)
+        savePreviewState()
+        updateActions()
+        refreshLibraryStates()
+        startLazyMetadata()
+    }
+
+    private fun skipExisting() {
+        val urls = adapter.currentList.map { it.url }
         lifecycleScope.launch {
-            var success = 0
-            var fail = 0
-            for (item in selected) {
-                try {
-                    withContext(Dispatchers.IO) {
-                        BookRepository(this@AddFromPageActivity).enqueueDownload(item.url)
-                    }
-                    success++
-                } catch (e: Exception) {
-                    Log.w("AddFromPage", "enqueue failed", e)
-                    fail++
-                }
+            setLoading(true)
+            try {
+                val states = withContext(Dispatchers.IO) { repository.previewBulkUrls(urls) }
+                if (adapter.currentList.map { it.url } != urls) return@launch
+                adapter.submitList(adapter.currentList.map { item ->
+                    val state = states[item.url] ?: "new"
+                    item.copy(state = state, checked = item.checked && state == "new")
+                })
+                savePreviewState()
+                status("Existing and already queued stories deselected")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                status("Cannot skip existing: ${e.message}")
+            } finally {
+                setLoading(false)
             }
-            textStatus.text = "Enqueued: $success, failed: $fail"
-            setFetchEnabled(true)
-            toast("Enqueued $success, failed $fail")
         }
     }
 
-    private fun runPreFlight(pageUrl: String): String? {
-        try {
-            val raw = pythonBridge?.getLoginStatus(pageUrl) ?: return null
-            val status = safeJson(raw)
-            if (status == null) return null
-            val usernamePresent = status.optBoolean("username_present", false)
-            val passwordPresent = status.optBoolean("password_present", false)
-            val site = status.optString("site").ifBlank { null }
-            return if ((usernamePresent && passwordPresent).not() && site != null) {
-                "Warning: $site may require configured credentials."
-            } else null
-        } catch (e: Exception) {
-            return null
+    private fun refreshLibraryStates() {
+        previewJob?.cancel()
+        if (adapter.currentList.isEmpty()) return
+        val urls = adapter.currentList.map { it.url }
+        previewJob = lifecycleScope.launch {
+            delay(100)
+            try {
+                val states = withContext(Dispatchers.IO) { repository.previewBulkUrls(urls) }
+                if (adapter.currentList.map { it.url } != urls) return@launch
+                adapter.submitList(adapter.currentList.map { item ->
+                    val state = states[item.url] ?: "new"
+                    item.copy(state = state, checked = item.checked && state != "queued")
+                })
+                savePreviewState()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                status("Cannot check library: ${e.message}. Queue actions will recheck before starting.")
+            }
         }
+    }
+
+    private fun applyMetadataResults(jobs: List<com.vivi.aharana.data.local.DownloadJobEntity>) {
+        val latest = jobs.filter { it.type == "metadata" && !it.inputUrl.isNullOrBlank() }
+            .groupBy { it.inputUrl!! }.mapValues { it.value.maxByOrNull { job -> job.createdAt }!! }
+        var changed = false
+        // Always derive from CURRENT rows, never a snapshot captured before a checkbox click.
+        val rows = adapter.currentList.map { item ->
+            val job = latest[item.url]
+            if (item.title.isBlank() && job?.status == "success") {
+                val meta = safeJson(job.resultJson)
+                if (meta?.optBoolean("ok") == true) {
+                    changed = true
+                    item.copy(title = meta.optString("title").ifBlank { item.url }, chapters = meta.optInt("chapters"))
+                } else item
+            } else item
+        }
+        if (changed) { adapter.submitList(rows); savePreviewState() }
+    }
+
+    private fun startLazyMetadata() {
+        if (metadataPaused) return
+        metadataJob?.cancel()
+        val urls = adapter.currentList.filter { it.title.isBlank() }.map { it.url }
+        if (urls.isEmpty()) return
+        metadataJob = lifecycleScope.launch {
+            try {
+                val jobs = withContext(Dispatchers.IO) { repository.getAllDownloadJobs() }
+                applyMetadataResults(jobs)
+                withContext(Dispatchers.IO) { repository.ensureBulkMetadata(urls) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                status("Preview ready; metadata lookup failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun queueSelected(mode: String) {
+        val selected = adapter.currentList.filter { it.checked }.map { it.url }
+        if (selected.isEmpty()) { showMessage("No stories selected"); return }
+        lifecycleScope.launch {
+            setLoading(true)
+            try {
+                val result = withContext(Dispatchers.IO) { repository.enqueueBulkUrls(selected, mode) }
+                val summary = "Downloads: ${result.downloads}, updates: ${result.updates}, skipped: ${result.skipped}, failed: ${result.failed}"
+                status(summary)
+                showMessage(summary)
+                refreshLibraryStates()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                status("Queue failed: ${e.message}")
+                showMessage("Queue failed: ${e.message}")
+            } finally {
+                setLoading(false)
+            }
+        }
+    }
+
+    private fun savePreviewState() {
+        if (!::inputUrl.isInitialized) return
+        val rows = JSONArray()
+        for (item in adapter.currentList) rows.put(JSONObject().apply {
+            put("url", item.url); put("title", item.title); put("chapters", item.chapters); put("checked", item.checked)
+        })
+        val root = JSONObject().apply {
+            put("pageUrl", inputUrl.text.toString()); put("normalize", checkNormalize.isChecked)
+            put("sourceLabel", sourceLabel); put("items", rows)
+            put("metadataPaused", metadataPaused)
+        }
+        // SharedPreferences applies in memory immediately and serializes disk writes atomically.
+        previewPrefs.edit().putString("state", root.toString()).apply()
+    }
+
+    private fun restorePreviewState() {
+        try {
+            val legacy = File(filesDir, "add_from_page/add_from_page_items.json")
+            val text = previewPrefs.getString("state", null) ?: if (legacy.exists()) legacy.readText() else return
+            val root = JSONObject(text)
+            inputUrl.setText(root.optString("pageUrl"))
+            checkNormalize.isChecked = root.optBoolean("normalize", true)
+            sourceLabel = root.optString("sourceLabel")
+            metadataPaused = root.optBoolean("metadataPaused", false)
+            val rows = root.optJSONArray("items") ?: return
+            val items = (0 until rows.length()).mapNotNull { i ->
+                val row = rows.optJSONObject(i) ?: return@mapNotNull null
+                val url = row.optString("url")
+                if (url.isBlank()) null else StoryItem(url, row.optString("title"), row.optInt("chapters"), row.optBoolean("checked", true))
+            }
+            adapter.submitList(items.distinctBy { it.url })
+            showSourceLabel()
+        } catch (e: Exception) {
+            status("Cannot restore saved preview: ${e.message}")
+        }
+    }
+
+    private fun showSourceLabel() {
+        textSeriesInfo.text = sourceLabel
+        textSeriesInfo.visibility = if (sourceLabel.isBlank()) View.GONE else View.VISIBLE
     }
 
     private fun setLoading(loading: Boolean) {
+        busy = loading
         progressBar.visibility = if (loading) View.VISIBLE else View.GONE
-        setFetchEnabled(!loading)
-    }
-
-    private fun setFetchEnabled(enabled: Boolean) {
-        buttonFetch.isEnabled = enabled
-        inputUrl.isEnabled = enabled
-        checkNormalize.isEnabled = enabled
+        buttonFetch.isEnabled = !loading
+        buttonImportFile.isEnabled = !loading
+        buttonPasteUrls.isEnabled = !loading
+        inputUrl.isEnabled = !loading
+        checkNormalize.isEnabled = !loading
+        buttonDownloadSelected.isEnabled = !loading
+        buttonUpdateExisting.isEnabled = !loading
+        buttonSkipExisting.isEnabled = !loading
     }
 
     private fun updateActions() {
-        val hasItems = adapter.itemCount > 0
-        textEmpty.visibility = if (hasItems) View.GONE else View.VISIBLE
-        val selectionBar = findViewById<View>(R.id.selectionBar)
-        selectionBar.visibility = if (hasItems) View.VISIBLE else View.GONE
-        buttonSelectAll.visibility = View.VISIBLE
-        buttonSelectNone.visibility = View.VISIBLE
-        buttonDownloadSelected.visibility = View.VISIBLE
+        val hasRows = adapter.itemCount > 0
+        textEmpty.visibility = if (hasRows) View.GONE else View.VISIBLE
+        findViewById<View>(R.id.selectionBar).visibility = if (hasRows) View.VISIBLE else View.GONE
     }
 
-    private fun safeJson(raw: String?): JSONObject? {
-        if (raw.isNullOrBlank()) return null
-        return try {
-            JSONObject(raw)
-        } catch (e: Exception) {
-            null
-        }
+    private fun status(message: String) {
+        textStatus.text = message
+        textStatus.visibility = View.VISIBLE
     }
+
+    private fun safeJson(raw: String?): JSONObject? = try {
+        if (raw.isNullOrBlank()) null else JSONObject(raw)
+    } catch (_: Exception) { null }
 
     private fun jsonStringList(obj: JSONObject, key: String): List<String> {
-        val arr = obj.optJSONArray(key)
-        return if (arr != null) {
-            List(arr.length()) { i -> arr.optString(i).orEmpty().trim() }.filter { it.isNotBlank() }
-        } else {
-            val raw = obj.optString(key).orEmpty().trim()
-            if (raw.isBlank()) emptyList() else raw.lines().map { it.trim() }.filter { it.isNotBlank() }
-        }
+        val array = obj.optJSONArray(key) ?: return emptyList()
+        return (0 until array.length()).map { array.optString(it).trim() }.filter { it.isNotBlank() }
     }
 
-    private fun toast(text: String) {
-        showMessage(text)
-    }
+    private data class StoryItem(val url: String, val title: String = "", val chapters: Int = 0,
+                                 val checked: Boolean = true, val state: String = "checking")
 
-    private fun addFromPageFile(): File = File(getAddFromPageDir(), "add_from_page_items.json")
-
-    private fun persistAddFromPageItems(pageUrl: String, normalize: Boolean, items: List<StoryItem>) {
-        try {
-            val root = JSONObject()
-            root.put("pageUrl", pageUrl)
-            root.put("normalize", normalize)
-            val arr = JSONArray()
-            for (item in items) {
-                val obj = JSONObject()
-                obj.put("url", item.url)
-                obj.put("title", item.title)
-                obj.put("chapters", item.chapters)
-                obj.put("checked", item.checked)
-                arr.put(obj)
-            }
-            root.put("items", arr)
-            addFromPageFile().writeText(root.toString())
-            DiagnosticLog.append(this, "AddFromPage", "persist_items pageUrl=$pageUrl count=${items.size}")
-        } catch (e: Exception) {
-            DiagnosticLog.appendException(this, "AddFromPage", "persist_items_failed", e)
-        }
-    }
-
-    private fun loadPersistedAddFromPageItems(): Triple<String, Boolean, List<StoryItem>>? {
-        return try {
-            val file = addFromPageFile()
-            if (!file.exists()) return null
-            val root = JSONObject(file.readText())
-            val pageUrl = root.optString("pageUrl", "").trim()
-            if (pageUrl.isBlank()) return null
-            val normalize = root.optBoolean("normalize", false)
-            val arr = root.optJSONArray("items") ?: return null
-            val items = mutableListOf<StoryItem>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val url = obj.optString("url", "").trim()
-                if (url.isBlank()) continue
-                items.add(
-                    StoryItem(
-                        url = url,
-                        title = obj.optString("title", ""),
-                        chapters = obj.optInt("chapters", 0),
-                        checked = obj.optBoolean("checked", true)
-                    )
-                )
-            }
-            if (items.isEmpty()) return null
-            val dedupedSeries = dedupeSeriesUrls(items)
-            val deduped = dedupeChapterSlugs(dedupedSeries)
-            DiagnosticLog.append(this, "AddFromPage", "load_persisted_items pageUrl=$pageUrl raw=${items.size} dedupedSeries=${dedupedSeries.size} deduped=${deduped.size}")
-            Triple(pageUrl, normalize, deduped)
-        } catch (e: Exception) {
-            DiagnosticLog.appendException(this, "AddFromPage", "load_persisted_items_failed", e)
-            null
-        }
-    }
-
-    private fun clearPersistedAddFromPageItems() {
-        try {
-            val file = addFromPageFile()
-            if (file.exists()) file.delete()
-            DiagnosticLog.append(this, "AddFromPage", "clear_persisted_items")
-        } catch (e: Exception) {
-            DiagnosticLog.appendException(this, "AddFromPage", "clear_persisted_items_failed", e)
-        }
-        fetchJob?.cancel()
-        fetchJob = null
-        metadataJob?.cancel()
-        metadataJob = null
-        adapter.submitList(emptyList())
-        textStatus.text = ""
-        textStatus.visibility = View.VISIBLE
-        textSeriesInfo.text = ""
-        textSeriesInfo.visibility = View.GONE
-        updateActions()
-    }
-
-    private fun getAddFromPageDir(): File {
-        val dir = File(filesDir, "add_from_page")
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
-
-    private fun dedupeExactUrls(items: List<StoryItem>): List<StoryItem> {
-        val seen = mutableSetOf<String>()
-        val result = mutableListOf<StoryItem>()
-        for (item in items) {
-            val url = item.url.trim()
-            if (seen.add(url)) {
-                result.add(item)
-            }
-        }
-        return result
-    }
-
-    private fun dedupeSeriesUrls(items: List<StoryItem>): List<StoryItem> {
-        val urls = items.map { it.url.trim() }
-        val seriesUrls = urls.filter { it.lowercase().contains("/series/") }
-        val seen = mutableSetOf<String>()
-        val result = mutableListOf<StoryItem>()
-
-        for (item in items) {
-            val url = item.url.trim()
-            val lower = url.lowercase()
-            val isChapterish = lower.contains("/ch-") || lower.contains("-ch-") || lower.contains("/chapter")
-
-            if (isChapterish && seriesUrls.any { seriesUrl ->
-                    val seriesBase = seriesUrl.substringBeforeLast('/').substringBeforeLast('/')
-                    url.startsWith(seriesBase, ignoreCase = true)
-                }) {
-                continue
-            }
-
-            if (seen.add(url)) {
-                result.add(item)
-            }
-        }
-
-        return result
-    }
-
-    private fun dedupeChapterSlugs(items: List<StoryItem>): List<StoryItem> {
-        val urls = items.map { it.url.trim() }
-        val storySlugSet = urls
-            .filter { url ->
-                val last = url.substringAfterLast('/')
-                !last.contains("-ch-")
-            }
-            .map { it.substringAfterLast('/') }
-            .toSet()
-
-        return items.filter { item ->
-            val url = item.url.trim()
-            val last = url.substringAfterLast('/')
-            if (!last.contains("-ch-")) {
-                true
-            } else {
-                val base = last.substringBefore("-ch-")
-                storySlugSet.none { it.startsWith(base, ignoreCase = true) }
-            }
-        }
-    }
-
-    private data class StoryItem(
-        val url: String,
-        var title: String = "",
-        var chapters: Int = 0,
-        var checked: Boolean = true
-    ) {
-        fun toParcelable(): StoryItemParcel = StoryItemParcel(url, title, chapters, checked)
-    }
-
-    private class StoryItemParcel(
-        val url: String,
-        val title: String,
-        val chapters: Int,
-        val checked: Boolean
-    ) : android.os.Parcelable {
-        fun toStoryItem(): AddFromPageActivity.StoryItem =
-            AddFromPageActivity.StoryItem(url, title, chapters, checked)
-
-        override fun describeContents(): Int = 0
-        override fun writeToParcel(dest: android.os.Parcel, flags: Int) {
-            dest.writeString(url)
-            dest.writeString(title)
-            dest.writeInt(chapters)
-            dest.writeByte(if (checked) 1 else 0)
-        }
-
-        companion object {
-            @JvmField
-            val CREATOR = object : android.os.Parcelable.Creator<StoryItemParcel> {
-                override fun createFromParcel(source: android.os.Parcel): StoryItemParcel =
-                    StoryItemParcel(
-                        url = source.readString().orEmpty(),
-                        title = source.readString().orEmpty(),
-                        chapters = source.readInt(),
-                        checked = source.readByte() != 0.toByte()
-                    )
-
-                override fun newArray(size: Int): Array<StoryItemParcel?> = arrayOfNulls(size)
-            }
-        }
-    }
-
-    private inner class StoryCheckAdapter :
-        RecyclerView.Adapter<StoryCheckAdapter.StoryVH>() {
-
-        private val items = mutableListOf<StoryItem>()
-
-        fun submitList(newItems: List<StoryItem>) {
-            items.clear()
-            items.addAll(newItems)
-            notifyDataSetChanged()
-        }
-
-        val currentList: List<StoryItem> get() = items
-
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): StoryVH {
-            val view = LayoutInflater.from(parent.context)
-                .inflate(R.layout.row_story_item, parent, false)
-            return StoryVH(view)
-        }
-
-        override fun getItemCount(): Int = items.size
-
-        override fun onBindViewHolder(holder: StoryVH, position: Int) {
-            holder.bind(items[position])
-        }
-
-        inner class StoryVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
-            private val checkSelected = itemView.findViewById<MaterialCheckBox>(R.id.checkSelected)
-            private val textTitle = itemView.findViewById<TextView>(R.id.textTitle)
-            private val textMeta = itemView.findViewById<TextView>(R.id.textMeta)
-
+    private inner class StoryCheckAdapter : RecyclerView.Adapter<StoryCheckAdapter.StoryVH>() {
+        private var rows: List<StoryItem> = emptyList()
+        val currentList: List<StoryItem> get() = rows
+        fun submitList(items: List<StoryItem>) { rows = items.toList(); notifyDataSetChanged() }
+        override fun getItemCount(): Int = rows.size
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): StoryVH = StoryVH(
+            LayoutInflater.from(parent.context).inflate(R.layout.row_story_item, parent, false))
+        override fun onBindViewHolder(holder: StoryVH, position: Int) = holder.bind(rows[position])
+        inner class StoryVH(view: View) : RecyclerView.ViewHolder(view) {
+            private val check = view.findViewById<MaterialCheckBox>(R.id.checkSelected)
             fun bind(item: StoryItem) {
-                textTitle.text = if (item.title.isNotBlank()) item.title else item.url
-                textMeta.text = if (item.chapters > 0) "${item.chapters} chapters" else item.url
-                checkSelected.isChecked = item.checked
-                itemView.setOnClickListener {
-                    val newChecked = !item.checked
-                    item.checked = newChecked
-                    checkSelected.isChecked = newChecked
+                itemView.findViewById<TextView>(R.id.textTitle).text = item.title.ifBlank { item.url }
+                val label = when (item.state) { "queued" -> "Already queued"; "library" -> "Already in library"; "new" -> "New"; else -> "Checking library…" }
+                itemView.findViewById<TextView>(R.id.textMeta).text = "$label${if (item.chapters > 0) " · ${item.chapters} chapters" else ""}\n${item.url}"
+                check.setOnCheckedChangeListener(null)
+                check.isChecked = item.checked
+                check.isEnabled = item.state != "queued" && item.state != "checking"
+                check.setOnCheckedChangeListener { _, checked ->
+                    val position = bindingAdapterPosition
+                    if (position != RecyclerView.NO_POSITION) {
+                        rows = rows.mapIndexed { i, row -> if (i == position) row.copy(checked = checked) else row }
+                        savePreviewState()
+                    }
                 }
-                checkSelected.setOnClickListener {
-                    item.checked = checkSelected.isChecked
-                }
+                itemView.setOnClickListener { if (check.isEnabled) check.isChecked = !check.isChecked }
             }
         }
     }

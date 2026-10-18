@@ -13,7 +13,7 @@
         app:showAsAction="always" />
     <item
         android:id="@+id/action_add_from_page"
-        android:title="Add from page"
+        android:title="Bulk import"
         app:showAsAction="never" />
     <item
         android:id="@+id/action_select"
@@ -42,6 +42,10 @@
     <item
         android:id="@+id/action_sort"
         android:title="Sort"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_filter_library"
+        android:title="Filter library"
         app:showAsAction="never" />
     <item
         android:id="@+id/action_search"

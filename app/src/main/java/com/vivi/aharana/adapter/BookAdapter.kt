@@ -14,12 +14,19 @@ import androidx.recyclerview.widget.RecyclerView
 import com.vivi.aharana.R
 import com.vivi.aharana.model.BookItem
 import com.vivi.aharana.util.CoverColorUtils
+import com.vivi.aharana.LibraryStoryStatus
+import com.vivi.aharana.LibraryStoryStatusLoader
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 class BookAdapter(
     private val books: List<BookItem>,
     private val onBookClicked: (BookItem) -> Unit,
     private val onBookLongClicked: (BookItem) -> Unit,
-    private val onSelectionChanged: () -> Unit = {}
+    private val onSelectionChanged: () -> Unit = {},
+    private val statusScope: CoroutineScope
 ) : RecyclerView.Adapter<BookAdapter.BookViewHolder>() {
 
     private val selectedIds = mutableSetOf<String>()
@@ -27,17 +34,51 @@ class BookAdapter(
         private set
 
     private val _books = books.toMutableList()
+    private var statusLoaderInstance: LibraryStoryStatusLoader? = null
+
+    private fun loader(context: android.content.Context): LibraryStoryStatusLoader =
+        statusLoaderInstance ?: LibraryStoryStatusLoader(context).also { statusLoaderInstance = it }
 
     inner class BookViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val textTitle: TextView = itemView.findViewById(R.id.textTitle)
         private val textAuthor: TextView = itemView.findViewById(R.id.textAuthor)
         private val imageCover: ImageView = itemView.findViewById(R.id.imageCover)
         private val textChapters: TextView = itemView.findViewById(R.id.textChapters)
+        private val textStatus: TextView = itemView.findViewById(R.id.textLibraryStatus)
+        private var statusJob: Job? = null
+        private var boundPath: String? = null
+
+        fun recycle() {
+            statusJob?.cancel()
+            statusJob = null
+            boundPath = null
+            textStatus.setText(R.string.library_status_loading)
+        }
+
+        private fun bindStatus(book: BookItem) {
+            recycle()
+            boundPath = book.uriString
+            textStatus.setText(R.string.library_status_loading)
+            val statusLoader = loader(itemView.context)
+            statusJob = statusScope.launch {
+                try {
+                    val status = statusLoader.load(book)
+                    if (boundPath == book.uriString) textStatus.text = itemView.context.getString(
+                        R.string.library_status_format, LibraryStoryStatus.label(status))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    if (boundPath == book.uriString) textStatus.setText(R.string.library_status_unavailable)
+                }
+            }
+        }
 
         fun bind(book: BookItem) {
+            bindStatus(book)
             textTitle.text = book.title.ifBlank { "Untitled" }
             textAuthor.text = book.author.ifBlank { "Unknown author" }
-            textChapters.text = if (book.chapters > 0) "${book.chapters} chapters" else ""
+            textChapters.text = if (book.chapters > 0)
+                itemView.resources.getQuantityString(R.plurals.library_chapter_count, book.chapters, book.chapters) else ""
             val selected = selectedIds.contains(book.uriString)
             itemView.isSelected = selected
             val card = itemView as com.google.android.material.card.MaterialCardView
@@ -189,9 +230,15 @@ class BookAdapter(
         holder.bind(_books[position])
     }
 
+    override fun onViewRecycled(holder: BookViewHolder) {
+        holder.recycle()
+        super.onViewRecycled(holder)
+    }
+
     override fun getItemCount(): Int = _books.size
 
     fun updateBooks(newBooks: List<BookItem>) {
+        statusLoaderInstance?.invalidate()
         // Keep the selection for books that are still present; drop ids that are
         // gone (deleted or filtered out). Clearing unconditionally here is what
         // used to make a background book update silently drop the selection.

@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.room.withTransaction
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -23,6 +24,11 @@ import com.vivi.aharana.model.BookItem
 import com.vivi.aharana.data.local.toBookItem
 import com.vivi.aharana.data.local.toEntity
 import com.vivi.aharana.FanFicFareWorker
+import kotlinx.coroutines.async
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -31,8 +37,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-class BookRepository(private val context: Context) {
+class BookRepository(context: Context) {
 
+    private val context = context.applicationContext
     private val database = AppDatabase.getInstance(context)
     private val bookDao = database.bookDao()
     private val downloadJobDao = database.downloadJobDao()
@@ -41,6 +48,10 @@ class BookRepository(private val context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("fanficfare_prefs", Context.MODE_PRIVATE)
 
     companion object {
+        private val metadataScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private val metadataSubmissionMutex = Mutex()
+        private val metadataGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+        private const val BULK_METADATA_TAG = "bulk_metadata_v1"
         private const val KEY_SORT = "sort"
         private const val KEY_SORT_DIRECTION = "sort_direction"
 
@@ -113,6 +124,7 @@ class BookRepository(private val context: Context) {
                     val infos = workManager.getWorkInfosForUniqueWork(workName).get()
                     val live = infos?.lastOrNull()
                     if (live == null) {
+                        if (System.currentTimeMillis() - job.createdAt < RECONCILE_GRACE_MS) continue
                         // The work itself is gone (cancelled, pruned, or lost with a
                         // force-stop): the row can never complete on its own.
                         markInterrupted(job, "interrupted_work_gone")
@@ -279,7 +291,7 @@ class BookRepository(private val context: Context) {
 
     fun remove(book: BookItem) {
         val list = (_books.value ?: emptyList()).toMutableList()
-        val removed = list.remove(book)
+        val removed = list.removeAll { it.uriString == book.uriString }
         _books.value = list
         if (removed) {
             scope.launch {
@@ -301,8 +313,10 @@ class BookRepository(private val context: Context) {
         DiagnosticLog.append(context, "FFF-Dup", msg)
         _books.value = newBooks.toList()
         scope.launch {
-            bookDao.clear()
-            bookDao.insertAll(newBooks.map { it.toEntity() })
+            database.withTransaction {
+                bookDao.clear()
+                bookDao.insertAll(newBooks.map { it.toEntity() })
+            }
         }
     }
 
@@ -329,8 +343,10 @@ class BookRepository(private val context: Context) {
     suspend fun saveLibrary(): Boolean {
         val books = _books.value ?: return false
         withContext(Dispatchers.IO) {
-            bookDao.clear()
-            bookDao.insertAll(books.map { it.toEntity() })
+            database.withTransaction {
+                bookDao.clear()
+                bookDao.insertAll(books.map { it.toEntity() })
+            }
         }
         return true
     }
@@ -433,6 +449,131 @@ class BookRepository(private val context: Context) {
         prefs.edit().putBoolean(KEY_SORT_DIRECTION, descending).apply()
     }
 
+    private suspend fun bulkSnapshot(): BulkQueueSnapshot {
+        val books = bookDao.getAll().map { book ->
+            BulkQueueBook(book.id, book.url, book.filePath,
+                BulkQueueStorage.isAvailable(book.filePath) { path ->
+                    context.contentResolver.openAssetFileDescriptor(android.net.Uri.parse(path), "r")?.use { descriptor ->
+                        // -1 means a provider cannot report length; probe only one byte, not the whole EPUB.
+                        descriptor.length != 0L && descriptor.createInputStream().use { it.read() != -1 }
+                    } ?: false
+                })
+        }
+        val jobs = downloadJobDao.getAll().map {
+            BulkQueueJob(it.type, it.status, it.inputUrl, it.bookId, it.inputPath)
+        }
+        return BulkQueueSnapshot(books, jobs)
+    }
+
+    suspend fun previewBulkUrls(urls: List<String>): Map<String, String> = withContext(Dispatchers.IO) {
+        bulkSnapshot().preview(urls)
+    }
+
+    suspend fun enqueueBulkUrls(urls: List<String>, mode: String): BulkQueueResult = withContext(Dispatchers.IO) {
+        require(mode in setOf("new", "update", "smart")) { "Unknown bulk action" }
+        BulkQueueCoordinator().enqueue(urls, mode, { bulkSnapshot() },
+            { url -> withContext(NonCancellable) { enqueueDownload(url) }; Unit },
+            { book -> withContext(NonCancellable) { enqueueUpdate(book.id, book.path) }; Unit })
+    }
+
+    /** Submission survives Activity recreation; each row is recoverable by its own work name.
+     * Reopening a preview retries failed/interrupted metadata, never from an observer loop.
+     */
+    suspend fun ensureBulkMetadata(urls: List<String>): List<Long> {
+        val generation = metadataGeneration.get()
+        return metadataScope.async {
+            metadataSubmissionMutex.withLock {
+                val manager = WorkManager.getInstance(context.applicationContext)
+                val existing = downloadJobDao.getAll().filter { it.type == "metadata" }
+                val requested = urls.distinct().toMutableSet()
+                val infos = manager.getWorkInfosByTag("fanficfare_metadata").get()
+                val legacyLive = infos.any { !it.state.isFinished && BULK_METADATA_TAG !in it.tags }
+                if (legacyLive && generation == metadataGeneration.get()) {
+                    // Legacy batch requests had no discoverable row/work-name link. Migrate
+                    // metadata only, cancelling them before resubmission to avoid duplicates.
+                    manager.cancelAllWorkByTag("fanficfare_metadata").result.get()
+                    existing.filter { it.status in setOf("queued", "waiting", "running") }.forEach { row ->
+                        row.inputUrl?.let { requested.add(it) }
+                        downloadJobDao.update(row.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
+                    }
+                }
+                val latest = existing.filter { !it.inputUrl.isNullOrBlank() }
+                    .groupBy { it.inputUrl!! }.mapValues { it.value.maxByOrNull { row -> row.createdAt }!! }
+                val submitted = mutableListOf<Long>()
+                for ((index, url) in requested.withIndex()) {
+                    if (generation != metadataGeneration.get()) break
+                    if (index > 0 && index % 5 == 0) kotlinx.coroutines.delay(200)
+                    val old = latest[url]
+                    val successful = old?.status == "success" && try {
+                        JSONObject(old.resultJson ?: "{}").optBoolean("ok")
+                    } catch (_: Exception) { false }
+                    val live = old?.workId?.let { name ->
+                        manager.getWorkInfosForUniqueWork(name).get().any { !it.state.isFinished }
+                    } ?: false
+                    if (!BulkQueueMetadataPolicy.needsSubmission(successful, live)) continue
+                    if (generation != metadataGeneration.get()) break
+                    // A non-cancellable bounded row+enqueue operation cannot leave a fresh
+                    // row unscheduled merely because a screen was rotated or replaced.
+                    withContext(NonCancellable) {
+                        val workName = java.util.UUID.randomUUID().toString()
+                        val row = DownloadJobEntity(type = "metadata", status = "queued", inputUrl = url,
+                            workId = workName, createdAt = System.currentTimeMillis())
+                        val id = downloadJobDao.insert(row)
+                        try {
+                            val work = OneTimeWorkRequestBuilder<FanFicFareWorker>()
+                                .setInputData(workDataOf(FanFicFareWorker.KEY_TYPE to "metadata",
+                                    FanFicFareWorker.KEY_URL to url, FanFicFareWorker.KEY_WORK_ID to workName))
+                                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                                .addTag("fanficfare_metadata").addTag(BULK_METADATA_TAG).build()
+                            manager.enqueueUniqueWork(workName, ExistingWorkPolicy.KEEP, work).result.get()
+                            submitted.add(id)
+                        } catch (e: Exception) {
+                            downloadJobDao.getById(id)?.let { current ->
+                                downloadJobDao.update(current.copy(status = "failed", error = "metadata_submission_failed",
+                                    finishedAt = System.currentTimeMillis()))
+                            }
+                            throw e
+                        }
+                    }
+                }
+                submitted.toList()
+            }
+        }.await()
+    }
+
+    fun cancelBulkMetadata() {
+        metadataGeneration.incrementAndGet()
+        metadataScope.launch {
+            try {
+                metadataSubmissionMutex.withLock {
+                    WorkManager.getInstance(context).cancelAllWorkByTag("fanficfare_metadata").result.get()
+                    downloadJobDao.getAll().filter {
+                        it.type == "metadata" && it.status in setOf("queued", "waiting", "running")
+                    }.forEach { row ->
+                        downloadJobDao.update(row.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
+                    }
+                }
+            } catch (e: Exception) {
+                DiagnosticLog.appendException(context, "BulkMetadata", "cancel_failed", e)
+            }
+        }
+    }
+
+    private suspend fun scheduleUserWork(jobId: Long, workName: String, work: OneTimeWorkRequest) {
+        try {
+            WorkManager.getInstance(context).enqueueUniqueWork(workName, ExistingWorkPolicy.KEEP, work).result.get()
+        } catch (e: Exception) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                downloadJobDao.getById(jobId)?.let { current ->
+                    if (current.status == "queued") downloadJobDao.update(current.copy(status = "failed",
+                        error = "work_submission_failed", finishedAt = System.currentTimeMillis()))
+                }
+            }
+            throw e
+        }
+    }
+
     suspend fun enqueueDownload(url: String): Long {
         // The work name is generated first and written on the row at insert time:
         // the worker looks the row up by it the instant it starts, and the
@@ -465,11 +606,7 @@ class BookRepository(private val context: Context) {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag(FanFicFareWorker.TAG_DOWNLOAD)
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            requestWorkId,
-            ExistingWorkPolicy.KEEP,
-            work
-        )
+        scheduleUserWork(jobId, requestWorkId, work)
         return jobId
     }
 
@@ -506,11 +643,7 @@ class BookRepository(private val context: Context) {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag(FanFicFareWorker.TAG_UPDATE)
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            FanFicFareWorker.UNIQUE_WORK_NAME,
-            ExistingWorkPolicy.KEEP,
-            work
-        )
+        scheduleUserWork(jobId, requestWorkId, work)
         return jobId
     }
 
@@ -547,11 +680,7 @@ class BookRepository(private val context: Context) {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag(FanFicFareWorker.TAG_FORCE_DOWNLOAD)
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            FanFicFareWorker.UNIQUE_WORK_NAME,
-            ExistingWorkPolicy.KEEP,
-            work
-        )
+        scheduleUserWork(jobId, requestWorkId, work)
         return jobId
     }
 
@@ -591,70 +720,8 @@ class BookRepository(private val context: Context) {
         return jobId
     }
 
-    /**
-     * Batch-enqueue metadata fetch jobs for multiple URLs.
-     *
-     * This avoids the "connection drop" bug that occurs when AddFromPageActivity
-     * enqueues metadata jobs one-at-a-time in a tight loop: each enqueue creates
-     * a separate DB row + WorkManager request, and the rapid-fire inserts trigger
-     * a cascade of observer callbacks (LibraryViewModel → DiffUtil → RecyclerView)
-     * that overwhelm the UI thread with O(n²) work.
-     *
-     * Strategy:
-     *   1. Insert ALL job entities in a single DB transaction (one observer
-     *      notification instead of N).
-     *   2. Enqueue WorkManager requests in small batches with a short delay
-     *      between batches, so the WorkManager scheduler and Chaquopy Python
-     *      runtime are not overwhelmed by dozens of simultaneous jobs.
-     */
-    suspend fun enqueueMetadataBatch(urls: List<String>): List<Long> = withContext(Dispatchers.IO) {
-        if (urls.isEmpty()) return@withContext emptyList()
-
-        val now = System.currentTimeMillis()
-        // Work names are assigned here, before the rows are inserted, for the same
-        // reason as the single-row enqueues above.
-        val workIds = urls.map { java.util.UUID.randomUUID().toString() }
-        val entities = urls.mapIndexed { index, url ->
-            DownloadJobEntity(
-                bookId = 0,
-                type = "metadata",
-                status = "queued",
-                inputUrl = url,
-                workId = workIds[index],
-                createdAt = now
-            )
-        }
-
-        // Single transaction — one observer notification for all rows
-        val jobIds = downloadJobDao.insertAll(entities)
-        DiagnosticLog.append(context, "MetadataBatch", "enqueued total=${urls.size} jobIds=$jobIds")
-
-        val batchSize = 5
-        urls.forEachIndexed { index, url ->
-            if (index > 0 && index % batchSize == 0) {
-                kotlinx.coroutines.delay(200)
-            }
-            val requestWorkId = workIds[index]
-            val work = OneTimeWorkRequestBuilder<FanFicFareWorker>()
-                .setInputData(
-                    workDataOf(
-                        FanFicFareWorker.KEY_TYPE to "metadata",
-                        FanFicFareWorker.KEY_URL to url,
-                        FanFicFareWorker.KEY_WORK_ID to requestWorkId
-                    )
-                )
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                        .build()
-                )
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .addTag("fanficfare_metadata")
-                .build()
-            WorkManager.getInstance(context).enqueue(work)
-        }
-        jobIds.toList()
-    }
+    /** Compatibility entry point: submission is serialized, durable and recoverable. */
+    suspend fun enqueueMetadataBatch(urls: List<String>): List<Long> = ensureBulkMetadata(urls)
 
     suspend fun getJob(jobId: Long): DownloadJobEntity? = downloadJobDao.getById(jobId)
 

@@ -111,7 +111,7 @@ class MainActivity : BaseActivity() {
                 }
             }, {
                 updateSelectionUi()
-            })
+            }, statusScope = lifecycleScope)
             findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.bookList).layoutManager = LinearLayoutManager(this)
             findViewById<androidx.recyclerview.widget.RecyclerView>(R.id.bookList).adapter = bookAdapter
             FastScrollerBuilder(findViewById<RecyclerView>(R.id.bookList))
@@ -122,10 +122,13 @@ class MainActivity : BaseActivity() {
                 .useMd2Style()
                 .build()
 
+            viewModel.configureFilters(applicationContext)
+            viewModel.filterProgress.observe(this) { updateFilterSummary() }
+            viewModel.filterError.observe(this) { message ->
+                if (message.isNotBlank()) toast(message)
+            }
             viewModel.visibleBooks.observe(this) { books ->
-                if (books.isNotEmpty()) {
-                    syncBooks(books)
-                }
+                syncBooks(books)
             }
 
             DiagnosticLog.append(this, "Main.Startup", "load_persisted_library_begin elapsed=${System.currentTimeMillis() - t0}")
@@ -222,6 +225,10 @@ class MainActivity : BaseActivity() {
                         showSortDialog()
                         true
                     }
+                    R.id.action_filter_library -> {
+                        showLibraryFilters()
+                        true
+                    }
                     R.id.action_search -> {
                         showSearchDialog()
                         true
@@ -315,8 +322,9 @@ class MainActivity : BaseActivity() {
     }
 
     private fun syncBooks(books: List<BookItem>) {
-        bookAdapter.updateBooks(books)
+        bookAdapter.updateBooks(viewModel.projectLibrary(books))
         updateEmptyState()
+        updateFilterSummary()
         // A background update can prune a selected book; keep the count honest.
         if (bookAdapter.isSelectionMode()) updateSelectionUi()
     }
@@ -671,6 +679,16 @@ class MainActivity : BaseActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_BOOK_DETAIL && resultCode == RESULT_OK && data != null) {
+            if (data.getBooleanExtra("story_refreshed", false)) {
+                // StoryRefreshStore is the sole writer. In particular do not clear/reinsert
+                // a stale Activity snapshot over the updated Room row or its new cover.
+                lifecycleScope.launch {
+                    viewModel.reloadFromStore()
+                    syncBooks(viewModel.getBooksSnapshot())
+                    updateEmptyState()
+                }
+                return
+            }
             val deleted = data.getBooleanExtra("deleted", false)
             if (deleted) {
                 val position = selectedBook?.let { viewModel.findByIdentity(it) } ?: -1
@@ -800,6 +818,51 @@ class MainActivity : BaseActivity() {
             }
             .setPositiveButton("Close") { dialog, _ -> dialog.dismiss() }
             .show()
+    }
+
+    private fun showLibraryFilters() {
+        LibraryFilterDialog(this, viewModel).show()
+    }
+
+    private fun updateFilterSummary() {
+        val selected = viewModel.getLibraryFilters()
+        val search = viewModel.searchQuery.value.orEmpty()
+        val visible = bookAdapter.itemCount
+        val total = viewModel.getBooksSnapshot().size
+        val active = selected.entries.joinToString(" · ") { (key, values) ->
+            "${LibraryFilters.categories[key]}: ${values.joinToString(", ")}"
+        }
+        val progress = viewModel.filterProgress.value.orEmpty()
+        val summary = findViewById<android.widget.TextView>(R.id.libraryFilterSummary)
+        summary.visibility = if (progress.isNotBlank() || selected.isNotEmpty() || search.isNotBlank())
+            android.view.View.VISIBLE else android.view.View.GONE
+        summary.text = when {
+            progress.isNotBlank() -> "Filters · $progress"
+            selected.isNotEmpty() -> "Filters · $visible/$total books · $active"
+            search.isNotBlank() -> "Filters · $visible/$total books · search active"
+            else -> "Filter library · $total books"
+        }
+        val narrowed = selected.isNotEmpty() || search.isNotBlank()
+        val presentation = LibraryListPresentation.choose(visible, viewModel.isRestoringLibrary(), progress.isNotBlank(), narrowed,
+            indexReady = viewModel.filterIndexReady())
+        val waiting = presentation == LibraryListPresentation.LOADING || presentation == LibraryListPresentation.REFRESHING
+        findViewById<android.widget.TextView>(R.id.textEmptyLibraryTitle).text =
+            when (presentation) {
+                LibraryListPresentation.LOADING -> "Loading saved library…"
+                LibraryListPresentation.REFRESHING -> if (viewModel.filterIndexReady()) "Checking for changes…" else "Preparing library…"
+                LibraryListPresentation.NO_MATCHES -> "No matching books"
+                LibraryListPresentation.UNAVAILABLE -> "Filter index unavailable"
+                else -> getString(R.string.empty_library_title)
+            }
+        findViewById<android.widget.TextView>(R.id.textEmptyLibrarySubtitle).text =
+            when {
+                waiting -> "Your saved filters are kept. Results will appear when the index is ready."
+                presentation == LibraryListPresentation.UNAVAILABLE -> "Saved filters are kept. Open Filter library to retry or clear filters."
+                narrowed -> "Change library filters or clear Search to show more books."
+                else -> getString(R.string.empty_library_subtitle)
+            }
+        findViewById<android.view.View>(R.id.buttonEmptyDownload).visibility =
+            if (waiting) android.view.View.GONE else android.view.View.VISIBLE
     }
 
     private fun showSearchDialog() {

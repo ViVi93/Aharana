@@ -6,7 +6,7 @@
     <string name="empty_library_action">Download a story</string>
     <string name="empty_library_desc">Illustration of an open book</string>
     <string name="empty_add_from_page_title">No stories found</string>
-    <string name="empty_add_from_page_subtitle">Paste a page URL above and tap \"Fetch stories\" to get started</string>
+    <string name="empty_add_from_page_subtitle">Fetch a page, import a URL file, or paste a story URL list to preview your batch</string>
     <string name="empty_add_from_page_desc">Illustration of a document with a search icon</string>
     <!-- Queue screen -->
     <string name="queue_title">Download Queue</string>
@@ -70,4 +70,7 @@
     <string name="title_edit_metadata">Edit metadata</string>
     <string name="title_merge_books">Merge books</string>
     <string name="title_settings">Settings</string>
+    <string name="library_status_loading">Loading…</string>
+    <string name="library_status_format">%1$s</string>
+    <string name="library_status_unavailable">Unavailable</string>
 </resources>
