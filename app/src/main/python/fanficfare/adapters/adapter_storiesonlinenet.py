@@ -138,7 +138,9 @@ class StoriesOnlineNetAdapter(BaseSiteAdapter):
         params['email'] = username
         params['password'] = password
         params['cmd'] = 'LOGIN'
-        postAction = soup.find('form')['action']
+        # An omitted action submits to the current document, including the
+        # WLPC redirect query used to return to the requested story.
+        postAction = soup.find('form').get('action', '')
         postUrl = urljoin(useurl,postAction)
         data = self.post_request(postUrl,params,usecache=False)
         # logger.debug(data)
