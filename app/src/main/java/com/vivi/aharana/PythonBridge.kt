@@ -37,6 +37,14 @@ class PythonBridge(private val context: Context) {
     fun getLoginStatus(url: String): String =
         safeCall("get_login_status", url)
 
+    fun organiseLibrary(action: String, payload: String = ""): String = try {
+        Python.getInstance().getModule("library_organizer").callAttr(
+            "json_call", action, payload, organisationPrivatePath(context.filesDir, "organisation").absolutePath
+        ).toString()
+    } catch (e: Exception) {
+        JSONObject().put("ok", false).put("error", e.message ?: "Organisation failed").toString()
+    }
+
     fun scanEpubDir(directory: String): String =
         safeCall("scan_epub_dir", directory)
 

@@ -52,6 +52,52 @@ object StorageBridge {
         }
     }
 
+    /** Only NEW story downloads use this preference. Exports retain copyToOutputDir behavior. */
+    fun copyDownloadedEpub(context: Context, sourceFile: File, outputDir: String): String =
+        LibraryEpubStorage.copyDownload(sourceFile, outputDir, SettingsActivity.getOrganiseDownloads(context),
+            legacyCopy = { source, root -> copyToOutputDir(context, source, root) },
+            organisedCopy = { source, root ->
+                // Resolve Android aliases in the trusted generation directory only.
+                // Keep the final file and output root subject to Python's no-follow checks.
+                val privateSource = if (source.absoluteFile.parentFile == context.filesDir.absoluteFile)
+                    organisationPrivatePath(context.filesDir, source.name) else source
+                val payload = org.json.JSONObject().put("source", privateSource.absolutePath).put("root", root)
+                val result = org.json.JSONObject(PythonBridge(context).organiseLibrary("copy_download", payload.toString()))
+                if (!result.optBoolean("ok")) throw IOException(result.optString("error", "Cannot organise downloaded EPUB"))
+                result.optString("path").takeIf { it.isNotBlank() }
+                    ?: throw IOException("Organised download returned no output path")
+            })
+
+    /** Preserve filesystem paths; picked documents save a verified copy and keep the original. */
+    fun replaceExistingEpub(context: Context, sourceFile: File, existingPath: String): String =
+        LibraryEpubStorage.saveExisting(sourceFile, existingPath,
+            replaceFile = { source, path -> LibraryEpubStorage.replace(source, File(path)) },
+            saveDocumentCopy = { saveUpdatedDocumentCopy(context, it) })
+
+    fun saveUpdatedDocumentCopy(context: Context, source: File): String {
+        check(source.isFile && source.length() > 0) { "Generated EPUB is missing or empty" }
+        val root = SettingsActivity.getOutputDir(context)
+        val name = source.nameWithoutExtension.take(100) + "-updated-${java.util.UUID.randomUUID()}.epub"
+        if (!root.startsWith("content://")) {
+            return StoryRefreshFiles.saveNewCopy(source, File(root), name).absolutePath
+        }
+        val directory = DocumentFile.fromTreeUri(context, Uri.parse(root))
+            ?: throw IOException("Invalid output directory")
+        val target = directory.createFile("application/epub+zip", name)
+            ?: throw IOException("Cannot create updated copy")
+        try {
+            context.contentResolver.openOutputStream(target.uri, "w")?.use { output ->
+                source.inputStream().use { it.copyTo(output) }
+            } ?: throw IOException("Cannot write updated copy")
+            context.contentResolver.openInputStream(target.uri)?.use { StoryRefreshFiles.verifyCopy(source, it) }
+                ?: throw IOException("Cannot verify updated copy")
+            return target.uri.toString()
+        } catch (e: Exception) {
+            target.delete()
+            throw e
+        }
+    }
+
     fun copyToOutputDir(context: Context, sourceFile: File, outputDir: String): String {
         return if (outputDir.startsWith("content://")) {
             val treeUri = Uri.parse(outputDir)

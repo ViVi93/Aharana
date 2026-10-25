@@ -3,6 +3,7 @@ package com.vivi.aharana.data.local
 import com.vivi.aharana.model.BookItem
 
 fun BookItem.toEntity(now: Long = System.currentTimeMillis()): BookEntity = BookEntity(
+    id = libraryId,
     title = title,
     author = author,
     url = url.ifBlank { null },
@@ -16,6 +17,7 @@ fun BookItem.toEntity(now: Long = System.currentTimeMillis()): BookEntity = Book
 )
 
 fun BookEntity.toBookItem(): BookItem = BookItem(
+    libraryId = id,
     title = title,
     author = author,
     uriString = filePath,

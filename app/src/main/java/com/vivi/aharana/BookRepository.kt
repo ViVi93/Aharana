@@ -51,6 +51,55 @@ class BookRepository(context: Context) {
         private val metadataScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val metadataSubmissionMutex = Mutex()
         private val metadataGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** Caller holds LibraryStorageGate. Safe to replay after process death or DB failure. */
+        suspend fun reconcileOrganisedPaths(context: Context, failOnError: Boolean = true): JSONObject = withContext(Dispatchers.IO) {
+            val journalDir = java.io.File(context.filesDir, "organisation")
+            if (!journalDir.exists()) return@withContext JSONObject().put("ok", true).put("can_undo", false)
+            if (!com.chaquo.python.Python.isStarted()) {
+                com.chaquo.python.Python.start(com.chaquo.python.android.AndroidPlatform(context.applicationContext))
+            }
+            val recovery = JSONObject(PythonBridge(context).organiseLibrary("recovery"))
+            val deletedBooks = recovery.optJSONArray("deleted_books") ?: JSONArray()
+            val rows = recovery.optJSONArray("moves") ?: JSONArray()
+            val moves = buildMap<String, String> {
+                for (i in 0 until rows.length()) {
+                    val row = rows.getJSONObject(i)
+                    put(row.getString("source"), row.getString("target"))
+                }
+            }
+            if (moves.isNotEmpty() || deletedBooks.length() > 0) {
+                val database = AppDatabase.getInstance(context.applicationContext)
+                val bookDao = database.bookDao()
+                val jobDao = database.downloadJobDao()
+                database.withTransaction {
+                    for (i in 0 until deletedBooks.length()) {
+                        val deletion = deletedBooks.getJSONObject(i)
+                        val current = bookDao.findById(deletion.optLong("book_id"))
+                        // Never delete a replacement row merely because it reused a path.
+                        if (current != null && current.filePath == deletion.getString("path")) bookDao.delete(current)
+                    }
+                    for (book in bookDao.getAll()) {
+                        val (path, source) = remapOrganisedPaths(book.filePath, book.sourcePath, moves)
+                        if (path != book.filePath || source != book.sourcePath) {
+                            bookDao.update(book.copy(filePath = path, sourcePath = source))
+                        }
+                    }
+                    for (job in jobDao.getAll()) {
+                        val input = job.inputPath?.let { moves[it] ?: it }
+                        val output = job.outputPath?.let { moves[it] ?: it }
+                        if (input != job.inputPath || output != job.outputPath) {
+                            jobDao.update(job.copy(inputPath = input, outputPath = output))
+                        }
+                    }
+                }
+            }
+            // A later transfer may need manual attention while earlier moves succeeded.
+            // Commit those exact paths before surfacing the recovery failure.
+            if (failOnError) check(recovery.optBoolean("ok")) { recovery.optString("error", "Cannot recover organisation journal") }
+            recovery
+        }
+
         private const val BULK_METADATA_TAG = "bulk_metadata_v1"
         private const val KEY_SORT = "sort"
         private const val KEY_SORT_DIRECTION = "sort_direction"
@@ -74,7 +123,6 @@ class BookRepository(context: Context) {
         android.util.Log.d("FFF-UI-OBS", "BookRepository init starting")
         scope.launch {
             migrateIfNeeded()
-            reconcileStaleRunningJobs()
             val initialEntities = bookDao.getAll()
             _books.postValue(initialEntities.map { it.toBookItem() })
             withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -86,6 +134,19 @@ class BookRepository(context: Context) {
                 downloadJobDao.observeAll().observeForever { jobs ->
                     android.util.Log.d("FFF-UI-OBS", "BookRepository job observer fired count=${jobs.size}")
                     _latestJobs.postValue(jobs)
+                }
+            }
+            // Keep the cached shelf usable while a worker owns storage during network I/O.
+            // All file mutations resolve recovery again under the same gate before acting.
+            try {
+                LibraryStorageGate.run {
+                    reconcileOrganisedPaths(context)
+                    reconcileStaleRunningJobs()
+                }
+            } catch (e: Exception) {
+                DiagnosticLog.appendException(context, "Library.Organise", "recovery_failed", e)
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context, "File organisation recovery needs attention: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -318,6 +379,34 @@ class BookRepository(context: Context) {
                 bookDao.insertAll(newBooks.map { it.toEntity() })
             }
         }
+    }
+
+    /** Caller holds the storage gate from recursive scan through commit. */
+    suspend fun importOrganisedLibrary(rows: JSONArray): Int = withContext(Dispatchers.IO) {
+        val seen = mutableSetOf<String>()
+        database.withTransaction {
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                val path = row.optString("path")
+                if (path.isBlank() || !seen.add(path)) continue
+                val existing = bookDao.findByFilePath(path)
+                val book = BookEntity(
+                    id = existing?.id ?: 0,
+                    title = row.optString("title", "untitled"),
+                    author = row.optString("author"),
+                    url = row.optString("url").ifBlank { null },
+                    filePath = path,
+                    sourcePath = existing?.sourcePath ?: path,
+                    lastModified = row.optLong("modified"),
+                    sizeBytes = row.optLong("size"),
+                    coverData = row.optString("cover").ifBlank { null },
+                    chapters = row.optInt("chapters"),
+                    addedAt = existing?.addedAt ?: System.currentTimeMillis()
+                )
+                if (existing != null) bookDao.update(book) else bookDao.insert(book)
+            }
+        }
+        seen.size
     }
 
     suspend fun loadLibrary(): Boolean {

@@ -15,6 +15,7 @@ class EditMetadataActivity : BaseActivity() {
 
     private lateinit var bridge: PythonBridge
     private lateinit var epubPath: String
+    private var bookId: Long = 0L
     private var backupSuffix: String? = ".metadata_edit_bak"
 
     // UI references
@@ -44,6 +45,7 @@ class EditMetadataActivity : BaseActivity() {
         Log.d("EditMetadata", "ENTER")
 
         epubPath = intent.getStringExtra("epub_path") ?: ""
+        bookId = intent.getLongExtra("book_id", 0L)
         Log.d("EditMetadata", "epub_path=$epubPath")
 
         bridge = PythonBridge(applicationContext)
@@ -129,20 +131,32 @@ class EditMetadataActivity : BaseActivity() {
 
         Thread {
             val resultJson = try {
-                StorageBridge.withLocalEpub(this, epubPath) { localPath ->
-                    bridge.writeEpubMetadata(
-                        localPath.absolutePath,
-                        fields.toString(),
-                        outputPath = null,
-                        backupSuffix = backupSuffix
-                    )
+                LibraryBookMutations.runBlocking(applicationContext, epubPath, expectedBookId = bookId) { mutation ->
+                    val saved = StorageBridge.withLocalEpub(this, mutation.path) { localPath ->
+                        val result = org.json.JSONObject(bridge.writeEpubMetadata(
+                            localPath.absolutePath,
+                            fields.toString(),
+                            outputPath = null,
+                            backupSuffix = backupSuffix
+                        ))
+                        if (result.optBoolean("ok")) {
+                            // Save while the SAF working file still exists; withLocalEpub deletes it on return.
+                            val finalPath = if (mutation.path.startsWith("content://")) {
+                                StorageBridge.saveUpdatedDocumentCopy(applicationContext, localPath)
+                            } else mutation.path
+                            result.put("output_path", finalPath)
+                        }
+                        result
+                    } ?: error("Cannot read EPUB from this location")
+                    if (saved.optBoolean("ok")) {
+                        val finalPath = saved.getString("output_path")
+                        mutation.persist(finalPath)
+                    }
+                    saved.toString()
                 }
             } catch (e: Exception) {
                 Log.e("EditMetadata", "save_metadata_exception", e)
                 runOnUiThread { showError("Cannot read EPUB: ${e.message ?: e.javaClass.simpleName}") }
-                return@Thread
-            } ?: run {
-                runOnUiThread { showError("Cannot read EPUB from this location") }
                 return@Thread
             }
 
@@ -163,8 +177,9 @@ class EditMetadataActivity : BaseActivity() {
                         val intent = Intent().apply {
                             putExtra("title", title)
                             putStringArrayListExtra("authors", ArrayList(authors))
-                            putExtra("output_path", epubPath)
+                            putExtra("output_path", result.optString("output_path", epubPath))
                             putExtra("modified", modified)
+                            putExtra("story_refreshed", true)
                         }
                         setResult(RESULT_OK, intent)
                         finish()

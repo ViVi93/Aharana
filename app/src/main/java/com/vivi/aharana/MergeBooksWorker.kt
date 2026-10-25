@@ -1,6 +1,9 @@
 package com.vivi.aharana
 
 import android.content.Context
+import androidx.room.withTransaction
+import com.vivi.aharana.data.local.AppDatabase
+import com.vivi.aharana.data.local.toEntity
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -52,30 +55,32 @@ class MergeBooksWorker(appContext: Context, params: WorkerParameters) :
 
         val bridge = PythonBridge(applicationContext)
         return try {
-            val result = JSONObject(
-                bridge.mergeBooks(
-                    JSONArray(paths).toString(), outputPath, title, author, baseIndex,
-                    tocStyle, shortenLabels, renumberChapters
+            LibraryBookMutations.withPaths(applicationContext, paths) { currentPaths ->
+                val result = JSONObject(
+                    bridge.mergeBooks(
+                        JSONArray(currentPaths).toString(), outputPath, title, author, baseIndex,
+                        tocStyle, shortenLabels, renumberChapters
+                    )
                 )
-            )
-            if (!result.optBoolean("ok", false)) {
-                return Result.failure(
-                    workDataOf(KEY_ERROR to result.optString("error", "Merge failed"))
+                if (!result.optBoolean("ok", false)) {
+                    return@withPaths Result.failure(
+                        workDataOf(KEY_ERROR to result.optString("error", "Merge failed"))
+                    )
+                }
+                val mergedPath = result.optString("output_path", "")
+                val registered = registerMergedBook(mergedPath, cover)
+                Result.success(
+                    workDataOf(
+                        KEY_OUTPUT to mergedPath,
+                        KEY_MESSAGE to if (registered) {
+                            "Merged ${paths.size} books into one"
+                        } else {
+                            // The file is on disk; only the library entry failed.
+                            "Merged into one book, but it could not be added to the library"
+                        }
+                    )
                 )
             }
-            val mergedPath = result.optString("output_path", "")
-            val registered = registerMergedBook(mergedPath, cover)
-            Result.success(
-                workDataOf(
-                    KEY_OUTPUT to mergedPath,
-                    KEY_MESSAGE to if (registered) {
-                        "Merged ${paths.size} books into one"
-                    } else {
-                        // The file is on disk; only the library entry failed.
-                        "Merged into one book, but it could not be added to the library"
-                    }
-                )
-            )
         } catch (e: Exception) {
             Result.failure(workDataOf(KEY_ERROR to (e.message ?: e.javaClass.simpleName)))
         }
@@ -113,7 +118,14 @@ class MergeBooksWorker(appContext: Context, params: WorkerParameters) :
         // worse: it clears the table and re-inserts that empty list, wiping the
         // whole library.
         return try {
-            BookRepository(applicationContext).upsertBook(book)
+            val database = AppDatabase.getInstance(applicationContext)
+            database.withTransaction {
+                val dao = database.bookDao()
+                val existing = dao.findByFilePath(path)
+                val entity = book.toEntity()
+                if (existing == null) dao.insert(entity)
+                else dao.update(entity.copy(id = existing.id, addedAt = existing.addedAt, sourcePath = existing.sourcePath))
+            }
             true
         } catch (e: Exception) {
             false

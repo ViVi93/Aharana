@@ -148,7 +148,7 @@ class FanFicFareWorker(
         candidate: BookEntity,
         filePath: String
     ): BookEntity {
-        val existing = if (!candidate.url.isNullOrBlank()) {
+        val existing = (if (candidate.id > 0) bookDao.findById(candidate.id) else null) ?: if (!candidate.url.isNullOrBlank()) {
             bookDao.findByUrl(candidate.url) ?: bookDao.findByFilePath(filePath)
         } else {
             bookDao.findByFilePath(filePath)
@@ -179,6 +179,39 @@ class FanFicFareWorker(
     }
 
     override suspend fun doWork(): Result {
+        // Foreground promotion must precede a possibly long wait for an organiser transaction.
+        setForeground(getForegroundInfo())
+        if (inputData.getString(KEY_TYPE) == TYPE_METADATA) return doWorkUnlocked()
+        return try {
+            LibraryStorageGate.run {
+                BookRepository.reconcileOrganisedPaths(applicationContext)
+                doWorkUnlocked()
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                // Cancellation can happen BEFORE acquiring storage exclusion: update only the
+                // job row here, never inspect an output file while the organiser may move it.
+                val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
+                dao.findByWorkId(inputData.getString(KEY_WORK_ID).orEmpty())?.let { job ->
+                    if (job.status != "success" && job.status != "cancelled") {
+                        dao.update(job.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
+                    }
+                }
+            }
+            throw e
+        } catch (e: Exception) {
+            logWorker("doWork", "storage_recovery_failed=${e.message}")
+            val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
+            dao.findByWorkId(inputData.getString(KEY_WORK_ID).orEmpty())?.let { job ->
+                if (job.status != "cancelled") dao.update(job.copy(status = "failed", error = e.message,
+                    finishedAt = System.currentTimeMillis()))
+            }
+            setPhase("failed")
+            Result.failure()
+        }
+    }
+
+    private suspend fun doWorkUnlocked(): Result {
         logWorker("doWork", "ENTER url=${inputData.getString(KEY_URL)} type=${inputData.getString(KEY_TYPE)} workId=${inputData.getString(KEY_WORK_ID)}")
         val type = inputData.getString(KEY_TYPE) ?: return Result.failure().also { logWorker("doWork", "no_type") }
         val url = inputData.getString(KEY_URL) ?: ""
@@ -192,8 +225,6 @@ class FanFicFareWorker(
             markInterruptedJob(workId)
             return Result.failure()
         }
-
-        setForeground(getForegroundInfo())
 
         if (isStopped) {
             logWorker("doWork", "stopped_early")
@@ -372,6 +403,11 @@ class FanFicFareWorker(
             TYPE_METADATA -> return Result.success()
         }
         val outputPath = existingJob.outputPath?.ifBlank { null } ?: return Result.failure()
+        // A completed job may outlive its book; never re-register a replacement at its old path.
+        if (existingJob.bookId > 0) {
+            val expected = bookDao.findById(existingJob.bookId)
+            if (expected == null || expected.filePath != outputPath) return Result.failure()
+        }
         val file = File(outputPath)
         val valid = file.exists() && file.isFile && file.length() > 0
         if (!valid) return Result.failure()
@@ -646,7 +682,7 @@ class FanFicFareWorker(
         val savedOutputDir = SettingsActivity.getOutputDir(applicationContext)
         logWorker("handleDownload", "output_dir=$savedOutputDir")
         val finalPath = try {
-            val copied = StorageBridge.copyToOutputDir(applicationContext, source, savedOutputDir)
+            val copied = StorageBridge.copyDownloadedEpub(applicationContext, source, savedOutputDir)
             logWorker("handleDownload", "copied_to=$copied")
             copied
         } catch (e: Exception) {
@@ -743,8 +779,13 @@ class FanFicFareWorker(
         jobDao: DownloadJobDao,
         job: DownloadJobEntity
     ): Result {
-        val existing = if (bookId > 0) bookDao.findById(bookId) else null
-        val path = inputPath.ifBlank { existing?.filePath } ?: return Result.failure()
+        // Room recovery remaps queued jobs; immutable WorkData may still name the old file.
+        val recoveredInputPath = jobDao.getById(job.id)?.inputPath?.takeIf { it.isNotBlank() } ?: inputPath
+        val existing = if (bookId > 0) {
+            bookDao.findById(bookId)
+                ?: error("Book is no longer in the library. Reload the library before applying.")
+        } else bookDao.findByFilePath(recoveredInputPath)
+        val path = LibraryEpubStorage.existingPath(existing?.filePath, recoveredInputPath)
         if (path.isBlank()) {
             jobDao.update(
                 job.copy(
@@ -758,46 +799,58 @@ class FanFicFareWorker(
         }
 
         val bridge = PythonBridge(applicationContext)
-        val outputDir = applicationContext.filesDir.absolutePath
-        val localFile = StorageBridge.resolveLocalEpub(applicationContext, path)?.first ?: return Result.failure()
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
+        val workDir = File(applicationContext.cacheDir, "epub-update-${java.util.UUID.randomUUID()}")
+        check(workDir.mkdirs()) { "Cannot create EPUB staging directory" }
+        try {
+            val outputDir = workDir.absolutePath
+            if (isStopped) {
+                jobDao.update(
+                    job.copy(
+                        status = "cancelled",
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
-        setPhase("downloading")
-        val raw = callBridgeWithRetry("handleUpdate") { bridge.updateEpubFromPath(localFile.absolutePath, outputDir) }
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
+                setPhase("cancelled")
+                return Result.failure()
+            }
+            setPhase("downloading")
+            val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
+                callBridgeWithRetry("handleUpdate") { bridge.updateEpubFromPath(localFile.absolutePath, outputDir) }
+            } ?: error("Cannot read existing EPUB at $path. Refresh the library and retry.")
+            if (isStopped) {
+                jobDao.update(
+                    job.copy(
+                        status = "cancelled",
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
-        val result = JSONObject(raw)
-        if (!result.optBoolean("ok")) {
-            jobDao.update(
-                job.copy(
-                    status = "failed",
-                    error = result.optString("error", "unknown"),
-                    finishedAt = System.currentTimeMillis()
+                setPhase("cancelled")
+                return Result.failure()
+            }
+            val result = JSONObject(raw)
+            if (!result.optBoolean("ok")) {
+                jobDao.update(
+                    job.copy(
+                        status = "failed",
+                        error = result.optString("error", "unknown"),
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("failed")
-            return Result.failure()
-        }
+                setPhase("failed")
+                return Result.failure()
+            }
 
-        val title = result.optString("title", existing?.title ?: "story")
-        val internalPath = result.optString("path", "")
-        if (internalPath.isNotBlank() && File(internalPath).exists()) {
+            val title = result.optString("title", existing?.title ?: "story")
+            val internalPath = result.optString("path", "")
+            if (result.optBoolean("skipped")) {
+                jobDao.update(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
+                    outputPath = path, finishedAt = System.currentTimeMillis()))
+                setPhase("completed", indeterminate = false)
+                return Result.success()
+            }
+            check(internalPath.isNotBlank() && File(internalPath).isFile) {
+                "Generated EPUB is missing; the original was kept"
+            }
             if (isStopped) {
                 jobDao.update(
                     job.copy(
@@ -809,11 +862,10 @@ class FanFicFareWorker(
                 return Result.failure()
             }
             setPhase("processing")
-            val savedOutputDir = SettingsActivity.getOutputDir(applicationContext)
             val finalPath = try {
-                StorageBridge.copyToOutputDir(applicationContext, File(internalPath), savedOutputDir)
+                StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
             } finally {
-                File(internalPath).delete()
+                if (File(internalPath).canonicalPath != File(path).canonicalPath) File(internalPath).delete()
             }
             if (isStopped) {
                 jobDao.update(
@@ -831,6 +883,7 @@ class FanFicFareWorker(
                     id = existing.id,
                     title = title,
                     filePath = finalPath,
+                    sourcePath = LibraryEpubStorage.sourceAfterReplacement(existing.filePath, existing.sourcePath, finalPath),
                     lastModified = result.optLong("modified", System.currentTimeMillis()),
                     sizeBytes = result.optLong("size", 0L),
                     coverData = result.optString("cover", existing.coverData ?: ""),
@@ -869,16 +922,7 @@ class FanFicFareWorker(
             )
             setPhase("completed", indeterminate = false)
             return Result.success()
-        }
-
-        jobDao.update(
-            job.copy(
-                status = "success",
-                finishedAt = System.currentTimeMillis()
-            )
-        )
-        setPhase("completed", indeterminate = false)
-        return Result.success()
+        } finally { workDir.deleteRecursively() }
     }
 
     private suspend fun handleForceDownload(
@@ -888,8 +932,13 @@ class FanFicFareWorker(
         jobDao: DownloadJobDao,
         job: DownloadJobEntity
     ): Result {
-        val existing = if (bookId > 0) bookDao.findById(bookId) else null
-        val path = inputPath.ifBlank { existing?.filePath } ?: return Result.failure()
+        // Room recovery remaps queued jobs; immutable WorkData may still name the old file.
+        val recoveredInputPath = jobDao.getById(job.id)?.inputPath?.takeIf { it.isNotBlank() } ?: inputPath
+        val existing = if (bookId > 0) {
+            bookDao.findById(bookId)
+                ?: error("Book is no longer in the library. Reload the library before applying.")
+        } else bookDao.findByFilePath(recoveredInputPath)
+        val path = LibraryEpubStorage.existingPath(existing?.filePath, recoveredInputPath)
         if (path.isBlank()) {
             jobDao.update(
                 job.copy(
@@ -903,46 +952,58 @@ class FanFicFareWorker(
         }
 
         val bridge = PythonBridge(applicationContext)
-        val outputDir = applicationContext.filesDir.absolutePath
-        val localFile = StorageBridge.resolveLocalEpub(applicationContext, path)?.first ?: return Result.failure()
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
+        val workDir = File(applicationContext.cacheDir, "epub-update-${java.util.UUID.randomUUID()}")
+        check(workDir.mkdirs()) { "Cannot create EPUB staging directory" }
+        try {
+            val outputDir = workDir.absolutePath
+            if (isStopped) {
+                jobDao.update(
+                    job.copy(
+                        status = "cancelled",
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
-        setPhase("downloading")
-        val raw = callBridgeWithRetry("handleForceDownload") { bridge.forceDownloadFromEpub(localFile.absolutePath, outputDir) }
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
+                setPhase("cancelled")
+                return Result.failure()
+            }
+            setPhase("downloading")
+            val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
+                callBridgeWithRetry("handleForceDownload") { bridge.forceDownloadFromEpub(localFile.absolutePath, outputDir) }
+            } ?: error("Cannot read existing EPUB at $path. Refresh the library and retry.")
+            if (isStopped) {
+                jobDao.update(
+                    job.copy(
+                        status = "cancelled",
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
-        val result = JSONObject(raw)
-        if (!result.optBoolean("ok")) {
-            jobDao.update(
-                job.copy(
-                    status = "failed",
-                    error = result.optString("error", "unknown"),
-                    finishedAt = System.currentTimeMillis()
+                setPhase("cancelled")
+                return Result.failure()
+            }
+            val result = JSONObject(raw)
+            if (!result.optBoolean("ok")) {
+                jobDao.update(
+                    job.copy(
+                        status = "failed",
+                        error = result.optString("error", "unknown"),
+                        finishedAt = System.currentTimeMillis()
+                    )
                 )
-            )
-            setPhase("failed")
-            return Result.failure()
-        }
+                setPhase("failed")
+                return Result.failure()
+            }
 
-        val title = result.optString("title", existing?.title ?: "story")
-        val internalPath = result.optString("path", "")
-        if (internalPath.isNotBlank() && File(internalPath).exists()) {
+            val title = result.optString("title", existing?.title ?: "story")
+            val internalPath = result.optString("path", "")
+            if (result.optBoolean("skipped")) {
+                jobDao.update(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
+                    outputPath = path, finishedAt = System.currentTimeMillis()))
+                setPhase("completed", indeterminate = false)
+                return Result.success()
+            }
+            check(internalPath.isNotBlank() && File(internalPath).isFile) {
+                "Generated EPUB is missing; the original was kept"
+            }
             if (isStopped) {
                 jobDao.update(
                     job.copy(
@@ -954,11 +1015,10 @@ class FanFicFareWorker(
                 return Result.failure()
             }
             setPhase("processing")
-            val savedOutputDir = SettingsActivity.getOutputDir(applicationContext)
             val finalPath = try {
-                StorageBridge.copyToOutputDir(applicationContext, File(internalPath), savedOutputDir)
+                StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
             } finally {
-                File(internalPath).delete()
+                if (File(internalPath).canonicalPath != File(path).canonicalPath) File(internalPath).delete()
             }
             if (isStopped) {
                 jobDao.update(
@@ -975,6 +1035,7 @@ class FanFicFareWorker(
                 existing.copy(
                     title = title,
                     filePath = finalPath,
+                    sourcePath = LibraryEpubStorage.sourceAfterReplacement(existing.filePath, existing.sourcePath, finalPath),
                     lastModified = result.optLong("modified", System.currentTimeMillis()),
                     sizeBytes = result.optLong("size", 0L),
                     coverData = result.optString("cover", existing.coverData ?: ""),
@@ -1013,16 +1074,7 @@ class FanFicFareWorker(
             )
             setPhase("completed", indeterminate = false)
             return Result.success()
-        }
-
-        jobDao.update(
-            job.copy(
-                status = "success",
-                finishedAt = System.currentTimeMillis()
-            )
-        )
-        setPhase("completed", indeterminate = false)
-        return Result.success()
+        } finally { workDir.deleteRecursively() }
     }
 
     private suspend fun handleMetadata(

@@ -69,7 +69,8 @@ class StoryRefreshActivity : BaseActivity() {
             return
         }
         val selection = savedInstanceState?.getStringArrayList("selected_fields")?.toSet()
-        model.initialize(path, selection)
+        val bookId = intent.getLongExtra("book_id", 0L)
+        model.initialize(path, selection, bookId)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

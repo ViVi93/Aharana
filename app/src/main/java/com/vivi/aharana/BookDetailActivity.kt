@@ -35,6 +35,7 @@ class BookDetailActivity : BaseActivity() {
     private lateinit var bookTitle: String
     private lateinit var bookAuthor: String
     private lateinit var bookPath: String
+    private var bookId: Long = 0L
     private var bookSource: String? = null
     private var bookModified: Long = 0
     private var bookSize: Long = 0
@@ -54,6 +55,7 @@ class BookDetailActivity : BaseActivity() {
         bookTitle = intent.getStringExtra("title") ?: ""
         bookAuthor = intent.getStringExtra("author") ?: ""
         bookPath = intent.getStringExtra("path") ?: ""
+        bookId = intent.getLongExtra("book_id", 0L)
         bookSource = intent.getStringExtra("source")
         bookModified = intent.getLongExtra("modified", 0L)
         bookSize = intent.getLongExtra("size", 0L)
@@ -119,6 +121,7 @@ class BookDetailActivity : BaseActivity() {
             // The preview reads the authoritative story URL from the EPUB itself.
             setOnClickListener {
                 startActivityForResult(Intent(this@BookDetailActivity, StoryRefreshActivity::class.java)
+                    .putExtra("book_id", bookId)
                     .putExtra("epub_path", bookPath), STORY_REFRESH_REQUEST)
             }
         }
@@ -221,180 +224,104 @@ class BookDetailActivity : BaseActivity() {
         }
     }
 
-    private fun updateBook() {
-        val bridge = PythonBridge(applicationContext).takeIf { it.getInitError() == null } ?: run {
-            DiagnosticLog.append(this, "Detail.Update", "bridge_unavailable")
-            showMessage("Bridge not available")
-            return
-        }
-        DiagnosticLog.append(this, "Detail.Update", "button_pressed title=$bookTitle url=$bookUrl path=$bookPath source=$bookSource")
-        val url = bookUrl
-        if (url.isBlank()) {
-            DiagnosticLog.append(this, "Detail.Update", "validation_failed reason=blank_url")
-            showError("No URL found for this book")
-            return
-        }
-        DiagnosticLog.append(this, "Detail.Update", "validation_passed url=$url")
-        DiagnosticLog.append(this, "Detail.Update", "starting")
-        Thread {
-            val resultJson = try {
-                DiagnosticLog.append(this, "Detail.Update", "bridge_start")
-                val raw = StorageBridge.withLocalEpub(this, bookPath) { localPath ->
-                    DiagnosticLog.append(this, "Detail.Update", "bridge_input=${localPath.absolutePath}")
-                    FanFicFareGate.runBlocking {
-                        bridge.updateEpubFromPath(localPath.absolutePath, filesDir.absolutePath)
-                    }
-                }
-                DiagnosticLog.append(this, "Detail.Update", "bridge_returned=${raw != null}")
-                raw
-            } catch (e: Exception) {
-                DiagnosticLog.appendException(this, "Detail.Update", "storage_bridge_exception", e)
-                runOnUiThread { showError("Cannot read EPUB from this location: ${e.message ?: e.javaClass.simpleName}") }
-                return@Thread
-            } ?: run {
-                DiagnosticLog.append(this, "Detail.Update", "bridge_null")
-                runOnUiThread { showError("Cannot read EPUB from this location") }
-                return@Thread
-            }
-            runOnUiThread {
-                try {
-                    val result = org.json.JSONObject(resultJson)
-                    DiagnosticLog.append(this, "Detail.Update", "parsed ok=${result.optBoolean("ok")} skipped=${result.optBoolean("skipped")}")
-                    if (result.optBoolean("ok")) {
-                        if (result.optBoolean("skipped")) {
-                            DiagnosticLog.append(this, "Detail.Update", "result=SKIPPED reason=${result.optString("reason", "already current")}")
-                            showError("Update skipped: ${result.optString("reason", "already current")}")
-                            return@runOnUiThread
-                        }
-                        val title = result.optString("title", bookTitle)
-                        val author = result.optString("author", bookAuthor)
-                        val internalPath = result.optString("path", "")
-                        if (internalPath.isBlank()) {
-                            DiagnosticLog.append(this, "Detail.Update", "result=FAILED empty_output_path")
-                            showError("Update failed: bridge returned empty output path")
-                            return@runOnUiThread
-                        }
-                        val outputDir = SettingsActivity.getOutputDir(this)
-                        try {
-                            val source = File(internalPath)
-                            if (!source.exists() || !source.isFile) {
-                                DiagnosticLog.append(this, "Detail.Update", "result=FAILED generated_file_missing=$internalPath")
-                                showError("Update failed: generated file missing at $internalPath")
-                                return@runOnUiThread
-                            }
-                            val finalPath = copyToOutputDir(source, outputDir)
-                            DiagnosticLog.append(this, "Detail.Update", "copied finalPath=$finalPath")
-                            Toast.makeText(applicationContext, "Updated: $title", Toast.LENGTH_LONG).show()
-                            if (!isFinishing && !isDestroyed) {
-                                window?.decorView?.postDelayed({
-                                    if (!isFinishing && !isDestroyed) finishWithResult(title, author, finalPath, System.currentTimeMillis(), null)
-                                }, 150)
-                            }
-                            DiagnosticLog.append(this, "Detail.Update", "result=SUCCESS title=$title path=$finalPath lifecycle_finishing=$isFinishing destroyed=$isDestroyed")
-                        } catch (e: Exception) {
-                            DiagnosticLog.appendException(this, "Detail.Update", "copy_output_exception", e)
-                            showError("Update failed: ${e.message ?: "copy/output error"}")
-                        }
-                    } else {
-                        DiagnosticLog.append(this, "Detail.Update", "result=FAILED error=${result.optString("error") ?: "unknown"}")
-                        showError("Update failed: ${result.optString("error") ?: "unknown"}")
-                    }
-                } catch (e: Exception) {
-                    DiagnosticLog.appendException(this, "Detail.Update", "result_parse_exception", e)
-                    showError("Update failed: invalid response from bridge")
-                }
-            }
-        }.start()
-    }
+    private fun updateBook() = downloadExistingBook(force = false)
 
-    private fun forceDownloadBook() {
-        val bridge = PythonBridge(applicationContext).takeIf { it.getInitError() == null } ?: run {
-            DiagnosticLog.append(this, "Detail.ForceDownload", "bridge_unavailable")
-            showMessage("Bridge not available")
-            return
-        }
-        DiagnosticLog.append(this, "Detail.ForceDownload", "button_pressed title=$bookTitle url=$bookUrl path=$bookPath source=$bookSource")
-        val url = bookUrl
-        if (url.isBlank()) {
-            DiagnosticLog.append(this, "Detail.ForceDownload", "validation_failed reason=blank_url")
-            showError("No URL found for this book")
-            return
-        }
-        DiagnosticLog.append(this, "Detail.ForceDownload", "validation_passed url=$url")
-        DiagnosticLog.append(this, "Detail.ForceDownload", "starting")
-        val t0 = System.currentTimeMillis()
+    private fun forceDownloadBook() = downloadExistingBook(force = true)
+
+    /** Resolve after recovery, then keep storage exclusion through generation, replacement and Room. */
+    private fun downloadExistingBook(force: Boolean) {
+        val tag = if (force) "Detail.ForceDownload" else "Detail.Update"
+        val label = if (force) "Force download" else "Update"
+        DiagnosticLog.append(this, tag, "START path=$bookPath")
         Thread {
-            var resultJson: String? = null
             try {
-                DiagnosticLog.append(this, "Detail.ForceDownload", "bridge_start elapsed=${System.currentTimeMillis() - t0}")
-                resultJson = StorageBridge.withLocalEpub(this, bookPath) { localPath ->
-                    DiagnosticLog.append(this, "Detail.ForceDownload", "bridge_input=${localPath.absolutePath} elapsed=${System.currentTimeMillis() - t0}")
-                    FanFicFareGate.runBlocking {
-                        bridge.forceDownloadFromEpub(localPath.absolutePath, filesDir.absolutePath)
-                    }
-                }
-                DiagnosticLog.append(this, "Detail.ForceDownload", "bridge_returned=${resultJson != null} elapsed=${System.currentTimeMillis() - t0}")
-            } catch (e: Exception) {
-                DiagnosticLog.appendException(this, "Detail.ForceDownload", "storage_bridge_exception", e)
-                runOnUiThread { showError("Cannot read EPUB from this location: ${e.message ?: e.javaClass.simpleName}") }
-                return@Thread
-            }
-            if (resultJson == null) {
-                DiagnosticLog.append(this, "Detail.ForceDownload", "bridge_null")
-                runOnUiThread { showError("Cannot read EPUB from this location") }
-                return@Thread
-            }
-            runOnUiThread {
-                try {
-                    val result = org.json.JSONObject(resultJson)
-                    DiagnosticLog.append(this, "Detail.ForceDownload", "parsed ok=${result.optBoolean("ok")}")
-                    if (result.optBoolean("ok")) {
-                        val title = result.optString("title", bookTitle)
-                        val author = result.optString("author", bookAuthor)
-                        val internalPath = result.optString("path", "")
-                        if (internalPath.isNotBlank()) {
-                            showMessage("Force downloaded: $title")
-                            Thread {
-                                val outputDir = SettingsActivity.getOutputDir(this)
-                                try {
-                                    val source = java.io.File(internalPath)
-                                    val finalPath = if (source.exists() && source.isFile) {
-                                        copyToOutputDir(source, outputDir)
-                                    } else {
-                                        null
-                                    }
-                                    runOnUiThread {
-                                        if (!isFinishing && !isDestroyed) {
-                                            if (finalPath != null) {
-                                                finishWithResult(title, author, finalPath, System.currentTimeMillis(), null)
-                                            } else {
-                                                showError("Force downloaded: $title")
-                                            }
-                                        }
-                                        DiagnosticLog.append(this, "Detail.ForceDownload", "result=SUCCESS title=$title path=$finalPath lifecycle_finishing=$isFinishing destroyed=$isDestroyed")
-                                    }
-                                } catch (e: Exception) {
-                                    runOnUiThread {
-                                        showError("Force download failed: ${e.message ?: "copy/output error"}")
-                                    }
-                                    DiagnosticLog.appendException(this, "Detail.ForceDownload", "copy_output_exception", e)
-                                }
-                            }.start()
-                        } else {
-                            DiagnosticLog.append(this, "Detail.ForceDownload", "result=SUCCESS empty_internal_path")
-                            showError("Force downloaded: $title")
+                val result = LibraryStorageGate.runBlocking {
+                    val recovery = BookRepository.reconcileOrganisedPaths(applicationContext)
+                    val moves = recovery.optJSONArray("moves")
+                    // Recovery is already flattened; remap this Intent's input exactly once.
+                    val recoveryPaths = buildMap<String, String> {
+                        if (moves != null) for (i in 0 until moves.length()) {
+                            val move = moves.getJSONObject(i)
+                            put(move.getString("source"), move.getString("target"))
                         }
-                    } else {
-                        val errorMsg = result.optString("error") ?: "unknown"
-                        val detail = result.optString("detail")
-                        val fullMsg = if (!detail.isNullOrBlank()) "$errorMsg\n$detail" else errorMsg
-                        DiagnosticLog.append(this, "Detail.ForceDownload", "result=FAILED $fullMsg")
-                        showError("Force download failed: $fullMsg")
                     }
-                } catch (e: Exception) {
-                    DiagnosticLog.appendException(this, "Detail.ForceDownload", "result_parse_exception", e)
-                    showError("Force download failed: invalid response from bridge")
+                    val resolvedPath = recoveryPaths[bookPath] ?: bookPath
+                    val bookDao = com.vivi.aharana.data.local.AppDatabase.getInstance(applicationContext).bookDao()
+                    val existing = if (bookId > 0) {
+                        bookDao.findById(bookId)
+                            ?: error("Book is no longer in the library. Reload the library before applying.")
+                    } else bookDao.findByFilePath(resolvedPath)
+                    val path = LibraryEpubStorage.existingPath(existing?.filePath, resolvedPath)
+                    val bridge = PythonBridge(applicationContext)
+                    check(bridge.getInitError() == null) { "Bridge not available: ${bridge.getInitError()}" }
+                    val workDir = File(cacheDir, "epub-detail-${java.util.UUID.randomUUID()}")
+                    check(workDir.mkdirs()) { "Cannot create EPUB staging directory" }
+                    try {
+                        DiagnosticLog.append(this, tag, "bridge_start input=$path")
+                        val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
+                            FanFicFareGate.runBlocking {
+                                if (force) bridge.forceDownloadFromEpub(localFile.absolutePath, workDir.absolutePath)
+                                else bridge.updateEpubFromPath(localFile.absolutePath, workDir.absolutePath)
+                            }
+                        } ?: error("Cannot read EPUB from this location. Refresh the library and retry.")
+                        val response = JSONObject(raw)
+                        DiagnosticLog.append(this, tag, "bridge_returned ok=${response.optBoolean("ok")} skipped=${response.optBoolean("skipped")}")
+                        if (!response.optBoolean("ok")) {
+                            val error = response.optString("error", "Unknown bridge error")
+                            val detail = response.optString("detail")
+                            error(if (detail.isBlank()) error else "$error\n$detail")
+                        }
+                        if (!response.optBoolean("skipped")) {
+                            val internalPath = response.optString("path")
+                            check(internalPath.isNotBlank()) { "Bridge returned no generated EPUB; the original was kept" }
+                            val finalPath = StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
+                            val sourcePath = LibraryEpubStorage.sourceAfterReplacement(
+                                existing?.filePath ?: bookPath, existing?.sourcePath ?: bookSource, finalPath)
+                            if (existing != null) {
+                                bookDao.update(existing.copy(
+                                    title = response.optString("title", existing.title),
+                                    author = response.optString("author", existing.author),
+                                    filePath = finalPath,
+                                    sourcePath = sourcePath,
+                                    lastModified = response.optLong("modified", System.currentTimeMillis()),
+                                    sizeBytes = File(finalPath).length(),
+                                    coverData = response.optString("cover", existing.coverData ?: ""),
+                                    url = response.optString("url", existing.url ?: ""),
+                                    chapters = response.optInt("chapters", existing.chapters)
+                                ))
+                            }
+                            response.put("path", finalPath).put("source", sourcePath)
+                            response.put("library_persisted", existing != null)
+                            DiagnosticLog.append(this, tag, "result=SUCCESS path=$finalPath")
+                        } else {
+                            DiagnosticLog.append(this, tag, "result=SKIPPED reason=${response.optString("reason")}")
+                        }
+                        response
+                    } finally {
+                        workDir.deleteRecursively()
+                    }
                 }
+                runOnUiThread {
+                    if (result.optBoolean("skipped")) {
+                        showMessage("$label skipped: ${result.optString("reason", "already current")}")
+                    } else {
+                        val title = result.optString("title", bookTitle)
+                        Toast.makeText(applicationContext, if (force) "Force downloaded: $title" else "Updated: $title", Toast.LENGTH_LONG).show()
+                        if (!isFinishing && !isDestroyed) {
+                            window?.decorView?.postDelayed({
+                                if (!isFinishing && !isDestroyed) finishWithResult(title,
+                                    result.optString("author", bookAuthor), result.getString("path"),
+                                    result.optLong("modified", System.currentTimeMillis()), result.optString("source"),
+                                    libraryPersisted = result.optBoolean("library_persisted"))
+                            }, 150)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                DiagnosticLog.appendException(this, tag, "result=FAILED", e)
+                runOnUiThread { showError("$label failed: ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                DiagnosticLog.append(this, tag, "END")
             }
         }.start()
     }
@@ -420,14 +347,14 @@ class BookDetailActivity : BaseActivity() {
 
     private fun deleteBook() {
         Thread {
-            val ok = StorageBridge.deleteEpub(this, bookPath)
-            runOnUiThread {
-                if (ok) {
-                    setResult(RESULT_OK, Intent().putExtra("deleted", true))
+            try {
+                LibraryBookMutations.runBlocking(applicationContext, bookPath, expectedBookId = bookId) { mutation -> mutation.delete() }
+                runOnUiThread {
+                    setResult(RESULT_OK, Intent().putExtra("deleted", true).putExtra("story_refreshed", true))
                     finish()
-                } else {
-                    showError("Delete failed")
                 }
+            } catch (e: Exception) {
+                runOnUiThread { showError("Delete failed: ${e.message ?: e.javaClass.simpleName}") }
             }
         }.start()
     }
@@ -465,6 +392,7 @@ class BookDetailActivity : BaseActivity() {
                         }
                     }
                     val intent = Intent(this, EditMetadataActivity::class.java).apply {
+                        putExtra("book_id", bookId)
                         putExtra("epub_path", bookPath)
                         putExtra("title", metadata.optString("title", ""))
                         putStringArrayListExtra("authors", ArrayList(authorsList))
@@ -500,6 +428,7 @@ class BookDetailActivity : BaseActivity() {
         // Launch MetadataPreviewActivity for user to preview online metadata
         // and cover candidates before explicitly applying.
         val intent = Intent(this, MetadataPreviewActivity::class.java).apply {
+            putExtra("book_id", bookId)
             putExtra("epub_path", bookPath)
             putExtra("title", bookTitle)
             putExtra("author", bookAuthor)
@@ -520,7 +449,11 @@ class BookDetailActivity : BaseActivity() {
                 }
             }
             EDIT_METADATA_REQUEST, PREVIEW_METADATA_REQUEST -> {
-                if (resultCode == RESULT_OK) {
+                if (resultCode == RESULT_OK && data?.getBooleanExtra("story_refreshed", false) == true) {
+                    // Child committed Room while holding storage exclusion. Never replay its old path.
+                    setResult(RESULT_OK, Intent(data).putExtra("story_refreshed", true))
+                    finish()
+                } else if (resultCode == RESULT_OK) {
                     val title = data?.getStringExtra("title") ?: bookTitle
                     val author = data?.getStringArrayListExtra("authors")?.joinToString(", ") ?: bookAuthor
                     val path = data?.getStringExtra("output_path") ?: bookPath
@@ -559,38 +492,32 @@ class BookDetailActivity : BaseActivity() {
                 // Encode as base64
                 val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
 
-                // Use a temp file for the operation
-                val resultJson = StorageBridge.withLocalEpub(this, bookPath) { localPath ->
-                    val outPath = localPath.absolutePath.replace(".epub", "_covered.epub")
-                    bridge.replaceEpubCover(localPath.absolutePath, base64, mime, outPath, ".bak")
+                val result = LibraryBookMutations.runBlocking(applicationContext, bookPath, expectedBookId = bookId) { mutation ->
+                    val isDocument = mutation.path.startsWith("content://")
+                    val raw = StorageBridge.withLocalEpub(this, mutation.path) { localPath ->
+                        // Filesystem books stay at the exact current path, including author folders.
+                        // Picked documents retain the existing separate-copy workflow.
+                        val outPath = if (mutation.path.startsWith("content://")) {
+                            File(localPath.parentFile, "covered_${java.util.UUID.randomUUID()}.epub").absolutePath
+                        } else null
+                        bridge.replaceEpubCover(localPath.absolutePath, base64, mime, outPath, ".bak")
+                    } ?: error("Cannot read EPUB from this location")
+                    val saved = JSONObject(raw)
+                    check(saved.optBoolean("ok")) { saved.optString("error", "Cover replacement failed") }
+                    val generated = File(saved.getString("output_path"))
+                    check(generated.isFile && generated.length() > 0) { "Cover output file missing" }
+                    val finalPath = if (isDocument) {
+                        try {
+                            StorageBridge.copyToOutputDir(this, generated, SettingsActivity.getOutputDir(this))
+                        } finally { generated.delete() }
+                    } else mutation.path
+                    mutation.persist(finalPath)
+                    saved.put("output_path", finalPath)
                 }
-
-                if (resultJson == null) {
-                    runOnUiThread { showError("Cannot read EPUB from this location") }
-                    return@Thread
-                }
-
-                val result = JSONObject(resultJson)
-                if (result.optBoolean("ok")) {
-                    val outputPath = result.optString("output_path", "")
-                    val outputDir = SettingsActivity.getOutputDir(this)
-                    val source = File(outputPath)
-                    if (source.exists() && source.isFile) {
-                        val finalPath = StorageBridge.copyToOutputDir(this, source, outputDir)
-                        // Clean up the local _covered.epub working file now that
-                        // it has been persisted to the user's output directory.
-                        // This mirrors the Phase 10 cleanup pattern in
-                        // MetadataPreviewActivity.applyMetadataAndCoverSafely.
-                        source.delete()
-                        runOnUiThread {
-                            showMessage("Cover replaced: ${result.optString("cover_path_in_epub", "")}")
-                            finishWithResult(bookTitle, bookAuthor, finalPath, System.currentTimeMillis(), null)
-                        }
-                    } else {
-                        runOnUiThread { showError("Cover replacement failed: output file missing") }
-                    }
-                } else {
-                    runOnUiThread { showError("Cover replacement failed: ${result.optString("error")}") }
+                runOnUiThread {
+                    showMessage("Cover replaced: ${result.optString("cover_path_in_epub", "")}")
+                    finishWithResult(bookTitle, bookAuthor, result.getString("output_path"),
+                        System.currentTimeMillis(), bookSource, libraryPersisted = true)
                 }
             } catch (e: Exception) {
                 runOnUiThread { showError("Cover replacement failed: ${e.message ?: e.javaClass.simpleName}") }
@@ -598,7 +525,7 @@ class BookDetailActivity : BaseActivity() {
         }.start()
     }
 
-    private fun finishWithResult(title: String, author: String, path: String, modified: Long, source: String?) {
+    private fun finishWithResult(title: String, author: String, path: String, modified: Long, source: String?, libraryPersisted: Boolean = false) {
         val blocked = isFinishing || isDestroyed
         if (blocked) {
             DiagnosticLog.append(this, "Detail.Update", "finishWithResult blocked isFinishing=$isFinishing isDestroyed=$isDestroyed")
@@ -609,6 +536,9 @@ class BookDetailActivity : BaseActivity() {
             putExtra("author", author)
             putExtra("path", path)
             putExtra("modified", modified)
+            // Existing MainActivity contract: the sole writer has already committed Room;
+            // reload instead of saving a stale Activity snapshot over this or an organiser move.
+            if (libraryPersisted) putExtra("story_refreshed", true)
             if (!source.isNullOrBlank()) putExtra("source", source)
         }
         setResult(RESULT_OK, data)

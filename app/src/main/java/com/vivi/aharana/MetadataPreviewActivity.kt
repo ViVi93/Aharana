@@ -41,6 +41,7 @@ class MetadataPreviewActivity : BaseActivity() {
 
     private lateinit var bridge: PythonBridge
     private lateinit var epubPath: String
+    private var bookId: Long = 0L
     private lateinit var bookTitle: String
     private lateinit var bookAuthor: String
     private var bookIsbn: String = ""
@@ -75,6 +76,7 @@ class MetadataPreviewActivity : BaseActivity() {
         applyBottomInset(findViewById<android.view.View>(R.id.contentScroll))
 
         epubPath = intent.getStringExtra("epub_path") ?: ""
+        bookId = intent.getLongExtra("book_id", 0L)
         bookTitle = intent.getStringExtra("title") ?: ""
         bookAuthor = intent.getStringExtra("author") ?: ""
         bookIsbn = intent.getStringExtra("isbn") ?: ""
@@ -583,6 +585,7 @@ class MetadataPreviewActivity : BaseActivity() {
                                     val out = Intent().apply {
                                         putExtra("title", onlineMeta.optString("title", bookTitle))
                                         putStringArrayListExtra("authors", extractAuthors(onlineMeta))
+                                        putExtra("story_refreshed", true)
                                         putExtra("output_path", r.optString("output_path", epubPath))
                                         putExtra("modified", System.currentTimeMillis())
                                     }
@@ -663,6 +666,7 @@ class MetadataPreviewActivity : BaseActivity() {
                                     val out = Intent().apply {
                                         putExtra("title", onlineMeta.optString("title", bookTitle))
                                         putStringArrayListExtra("authors", extractAuthors(onlineMeta))
+                                        putExtra("story_refreshed", true)
                                         putExtra("output_path", r.optString("output_path", epubPath))
                                         putExtra("modified", System.currentTimeMillis())
                                     }
@@ -712,6 +716,7 @@ class MetadataPreviewActivity : BaseActivity() {
                                 if (r.optBoolean("ok") && r.optBoolean("cover_written")) {
                                     showMessage("Cover applied successfully")
                                     val out = Intent().apply {
+                                        putExtra("story_refreshed", true)
                                         putExtra("output_path", r.optString("output_path", epubPath))
                                         putExtra("modified", System.currentTimeMillis())
                                     }
@@ -772,9 +777,24 @@ class MetadataPreviewActivity : BaseActivity() {
         imageDataBase64: String?,
         imageMime: String?,
         backupSuffix: String?,
+    ): String = LibraryBookMutations.runBlocking(applicationContext, epubPath, expectedBookId = bookId) { mutation ->
+        val raw = applyMetadataAndCoverAtPath(mutation.path, fieldsJson, imageDataBase64, imageMime, backupSuffix)
+        val result = JSONObject(raw)
+        if (result.optBoolean("ok")) {
+            mutation.persist(result.optString("output_path").ifBlank { mutation.path })
+        }
+        result.toString()
+    }
+
+    private fun applyMetadataAndCoverAtPath(
+        path: String,
+        fieldsJson: String,
+        imageDataBase64: String?,
+        imageMime: String?,
+        backupSuffix: String?,
     ): String {
-        val isContentUri = epubPath.startsWith("content://")
-        return StorageBridge.withLocalEpub(this, epubPath) { localPath ->
+        val isContentUri = path.startsWith("content://")
+        return StorageBridge.withLocalEpub(this, path) { localPath ->
             val outputPath: String? = if (isContentUri) {
                 // Write to a separate file in filesDir so it survives
                 // withLocalEpub()'s temp-file cleanup in its finally block.

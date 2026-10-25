@@ -342,6 +342,8 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
     }
 
     fun enqueueDownload(url: String) = viewModelScope.launch { repository.enqueueDownload(url) }
+    suspend fun importOrganisedLibrary(rows: org.json.JSONArray): Int = repository.importOrganisedLibrary(rows)
+
     fun enqueueUpdate(bookId: Long, inputPath: String) = viewModelScope.launch { repository.enqueueUpdate(bookId, inputPath) }
     fun enqueueForceDownload(bookId: Long, inputPath: String) = viewModelScope.launch { repository.enqueueForceDownload(bookId, inputPath) }
     suspend fun enqueueMetadata(url: String): Long = repository.enqueueMetadata(url)

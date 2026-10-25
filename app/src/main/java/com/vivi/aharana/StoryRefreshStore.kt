@@ -9,12 +9,34 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** File/SAF persistence for explicit story refresh, always off the main thread and inside engine gate. */
+/** File/SAF persistence for explicit story refresh. Apply holds storage then engine exclusion; preview snapshots release storage before network. */
 internal class StoryRefreshStore(context: Context, private val bridge: PythonBridge) {
     private val context = context.applicationContext
     private val database = AppDatabase.getInstance(this.context)
 
-    suspend fun apply(originalPath: String, preview: JSONObject, selected: Set<String>, cover: Boolean): JSONObject {
+    /** Copy only the local read under storage exclusion; network preview never holds that gate. */
+    suspend fun snapshot(path: String, expectedBookId: Long = 0L): File =
+        LibraryBookMutations.run(context, path, expectedBookId = expectedBookId) { mutation ->
+        val snapshot = File.createTempFile("story_preview_", ".epub", context.cacheDir)
+        try {
+            StorageBridge.withLocalEpub(context, mutation.path) { local ->
+                local.inputStream().use { input -> snapshot.outputStream().use { input.copyTo(it) } }
+            } ?: error("Cannot read this EPUB")
+            check(snapshot.length() > 0) { "Cannot read this EPUB" }
+            snapshot
+        } catch (e: Exception) {
+            snapshot.delete()
+            throw e
+        }
+    }
+
+    suspend fun apply(originalPath: String, preview: JSONObject, selected: Set<String>, cover: Boolean,
+                      expectedBookId: Long = 0L): JSONObject =
+        LibraryBookMutations.run(context, originalPath, expectedBookId = expectedBookId) { mutation ->
+            FanFicFareGate.run { applyAtPath(mutation.path, preview, selected, cover) }
+        }
+
+    private suspend fun applyAtPath(originalPath: String, preview: JSONObject, selected: Set<String>, cover: Boolean): JSONObject {
         val dao = database.bookDao()
         val original = dao.findByFilePath(originalPath)
             ?: error("Book is no longer in the library. Reload the library before applying.")

@@ -10,5 +10,6 @@ data class BookItem(
     val url: String = "",
     val chapters: Int = 0,
     val sourceUriString: String? = null,
-    val addedAt: Long = 0L
+    val addedAt: Long = 0L,
+    val libraryId: Long = 0L
 )

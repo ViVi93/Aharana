@@ -25,13 +25,15 @@ internal data class StoryRefreshState(
 internal class StoryRefreshViewModel(application: Application) : AndroidViewModel(application) {
     val state = MutableLiveData(StoryRefreshState())
     private var sourcePath: String? = null
+    private var bookId: Long = 0L
     private var restoredSelection: Set<String>? = null
     private val bridge by lazy { PythonBridge(getApplication<Application>()) }
     private val store by lazy { StoryRefreshStore(getApplication(), bridge) }
 
-    fun initialize(path: String, restored: Set<String>?) {
+    fun initialize(path: String, restored: Set<String>?, expectedBookId: Long = 0L) {
         if (sourcePath != null) return
         sourcePath = path
+        bookId = expectedBookId
         restoredSelection = restored
         load(false)
     }
@@ -54,14 +56,14 @@ internal class StoryRefreshViewModel(application: Application) : AndroidViewMode
         viewModelScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
-                    FanFicFareGate.run {
-                        bridge.initialize(SettingsActivity.getConfigDir(getApplication()).absolutePath)
-                        DiagnosticLog.append(getApplication(), "StoryRefresh", "preview_start cover=$includeCover")
-                        val raw = StorageBridge.withLocalEpub(getApplication(), path) {
-                            bridge.previewStoryRefresh(it.absolutePath, includeCover)
-                        } ?: error("Cannot read this EPUB")
-                        checkedJson(raw)
-                    }
+                    val snapshot = store.snapshot(path, expectedBookId = bookId)
+                    try {
+                        FanFicFareGate.run {
+                            bridge.initialize(SettingsActivity.getConfigDir(getApplication()).absolutePath)
+                            DiagnosticLog.append(getApplication(), "StoryRefresh", "preview_start cover=$includeCover")
+                            checkedJson(bridge.previewStoryRefresh(snapshot.absolutePath, includeCover))
+                        }
+                    } finally { snapshot.delete() }
                 }
                 val fields = result.optJSONArray("fields") ?: JSONArray()
                 val availableChanged = (0 until fields.length()).mapNotNull { index ->
@@ -96,10 +98,8 @@ internal class StoryRefreshViewModel(application: Application) : AndroidViewMode
             try {
                 // Once accepted, a bounded file rewrite/library update finishes despite rotation/closing.
                 val result = withContext(NonCancellable + Dispatchers.IO) {
-                    FanFicFareGate.run {
-                        DiagnosticLog.append(getApplication(), "StoryRefresh", "apply_start fields=${selected.size} cover=$withCover")
-                        store.apply(path, preview, selected, withCover)
-                    }
+                    DiagnosticLog.append(getApplication(), "StoryRefresh", "apply_start fields=${selected.size} cover=$withCover")
+                    store.apply(path, preview, selected, withCover, expectedBookId = bookId)
                 }
                 state.value = current.copy(busy = false, applying = false, result = result,
                     message = result.optString("notice", "Saved. Chapters and title page unchanged.") +

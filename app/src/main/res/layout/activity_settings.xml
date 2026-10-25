@@ -89,6 +89,20 @@
                 android:text="Pick Folder"
                 style="@style/Widget.Material3Expressive.Button.OutlinedButton" />
 
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchOrganiseDownloads"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Organise future downloads" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Save new downloads as Author/Title.epub using EPUB metadata: author folders and title filenames. Requires a filesystem output path, not a picked folder URI. Use Organise Library for existing books; updates keep their current paths."
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/buttonSave"
                 android:layout_width="wrap_content"

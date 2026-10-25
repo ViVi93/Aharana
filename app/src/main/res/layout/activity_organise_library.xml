@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical">
+    <com.google.android.material.appbar.AppBarLayout android:id="@+id/appBar"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+        <com.google.android.material.appbar.MaterialToolbar android:id="@+id/toolbar"
+            android:layout_width="match_parent" android:layout_height="?attr/actionBarSize"
+            app:title="Organise existing books" app:navigationIcon="@drawable/ic_arrow_back_24"
+            app:navigationIconTint="?attr/colorOnSurfaceVariant" />
+    </com.google.android.material.appbar.AppBarLayout>
+    <LinearLayout android:id="@+id/organiseContent" android:layout_width="match_parent"
+        android:layout_height="0dp" android:layout_weight="1" android:padding="16dp" android:orientation="vertical">
+        <com.google.android.material.textfield.TextInputLayout android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:hint="Library root folder">
+            <com.google.android.material.textfield.TextInputEditText android:id="@+id/organiseRoot"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:inputType="textUri" android:maxLines="2" />
+        </com.google.android.material.textfield.TextInputLayout>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" android:text="Author/Title.epub · Includes subfolders · Offline\nBack up first. Missing titles or unreadable books are skipped. Duplicate names get a suffix; nothing is overwritten."
+            android:textAppearance="?attr/textAppearanceBodySmall" />
+        <ProgressBar android:id="@+id/organiseProgress" style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:indeterminate="true" android:visibility="gone" />
+        <TextView android:id="@+id/organiseStatus" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:layout_marginVertical="8dp"
+            android:accessibilityLiveRegion="polite" android:textIsSelectable="true" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/buttonOrganisePreview"
+            style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Preview changes" />
+        <androidx.recyclerview.widget.RecyclerView android:id="@+id/organiseRows"
+            android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+            android:clipToPadding="false" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/buttonOrganiseApply"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:enabled="false" android:text="Organise previewed books" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/buttonOrganiseUndo"
+            style="@style/Widget.Material3Expressive.Button.OutlinedButton"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:enabled="false" android:text="Undo last organisation" />
+    </LinearLayout>
+</LinearLayout>

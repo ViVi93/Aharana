@@ -81,6 +81,15 @@ _Coming soon._
 
 ### Library management
 
+- **Organise existing books** from the overflow menu: preview moves based on embedded
+  EPUB metadata into `Author/Title.epub`, then apply or undo. Filename collisions
+  are handled without overwriting unrelated books. Back up your library first.
+- **Organise future downloads** is a separate, opt-in setting: enable it in Settings
+  and tap **Save** to use author folders and title filenames for new books.
+  Organising existing books does not enable this switch. Normal updates and force
+  downloads retain an existing book's organised location. Organisation requires a
+  filesystem folder; SAF `content://` destinations are not supported by this mode.
+
 - **Library list** of every downloaded/imported EPUB, with the real cover extracted
   from the EPUB (falls back to a generated cover with the story's initials on a
   deterministic colour).

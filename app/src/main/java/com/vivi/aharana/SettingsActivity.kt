@@ -27,6 +27,8 @@ class SettingsActivity : BaseActivity() {
         val output = findViewById<EditText>(R.id.inputOutputDir)
         val prefs = getSharedPreferences("fanficfare_prefs", MODE_PRIVATE)
         output.setText(prefs.getString("output_dir", ""))
+        val organiseDownloads = findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.switchOrganiseDownloads)
+        organiseDownloads.isChecked = prefs.getBoolean(KEY_ORGANISE_DOWNLOADS, false)
 
         setupThemeSelector(prefs)
         setupDynamicColorSwitch(prefs)
@@ -38,7 +40,12 @@ class SettingsActivity : BaseActivity() {
 
         findViewById<Button>(R.id.buttonSave).setOnClickListener {
             val dir = output.text.toString().trim()
-            prefs.edit().putString("output_dir", dir).apply()
+            if (organiseDownloads.isChecked && dir.startsWith("content://")) {
+                showMessage("Author folders need a filesystem output path. Enter a folder path or turn off Organise future downloads.")
+                return@setOnClickListener
+            }
+            prefs.edit().putString("output_dir", dir)
+                .putBoolean(KEY_ORGANISE_DOWNLOADS, organiseDownloads.isChecked).apply()
             showMessage("Saved")
             finish()
         }
@@ -354,6 +361,12 @@ class SettingsActivity : BaseActivity() {
     }
 
     companion object {
+        const val KEY_ORGANISE_DOWNLOADS = "organise_downloads"
+
+        fun getOrganiseDownloads(context: Context): Boolean =
+            context.getSharedPreferences("fanficfare_prefs", Context.MODE_PRIVATE)
+                .getBoolean(KEY_ORGANISE_DOWNLOADS, false)
+
         fun getOutputDir(context: Context): String {
             val prefs = context.getSharedPreferences("fanficfare_prefs", Context.MODE_PRIVATE)
             val configured = prefs.getString("output_dir", null)

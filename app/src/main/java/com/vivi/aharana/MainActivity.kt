@@ -205,6 +205,11 @@ class MainActivity : BaseActivity() {
                         showLoadLibraryDialog()
                         true
                     }
+                    R.id.action_organise_library -> {
+                        startActivity(Intent(this, OrganiseLibraryActivity::class.java)
+                            .putExtra("library_root", libraryFolderPath ?: SettingsActivity.getOutputDir(this)))
+                        true
+                    }
                     R.id.action_settings -> {
                         startActivity(android.content.Intent(this, SettingsActivity::class.java))
                         true
@@ -365,7 +370,7 @@ class MainActivity : BaseActivity() {
         }
         toast("Updating ${selected.size} books...")
         for (book in selected) {
-            viewModel.enqueueUpdate(0, book.uriString)
+            viewModel.enqueueUpdate(book.libraryId, book.uriString)
         }
         clearSelectionMode()
     }
@@ -451,6 +456,7 @@ class MainActivity : BaseActivity() {
 
     private fun openBookDetail(book: BookItem) {
         val intent = Intent(this, BookDetailActivity::class.java)
+            .putExtra("book_id", book.libraryId)
             .putExtra("title", book.title)
             .putExtra("author", book.author)
             .putExtra("path", book.uriString)
@@ -470,7 +476,7 @@ class MainActivity : BaseActivity() {
             return
         }
         DiagnosticLog.append(this, "Main.Update", "starting")
-        viewModel.enqueueUpdate(0, book.uriString)
+        viewModel.enqueueUpdate(book.libraryId, book.uriString)
         DiagnosticLog.append(this, "Main.Update", "enqueued path=${book.uriString}")
     }
 
@@ -483,7 +489,7 @@ class MainActivity : BaseActivity() {
             return
         }
         DiagnosticLog.append(this, "Main.ForceDownload", "starting")
-        viewModel.enqueueForceDownload(0, book.uriString)
+        viewModel.enqueueForceDownload(book.libraryId, book.uriString)
         DiagnosticLog.append(this, "Main.ForceDownload", "enqueued path=${book.uriString}")
     }
 
@@ -492,20 +498,17 @@ class MainActivity : BaseActivity() {
             .setTitle("Delete")
             .setMessage("Delete ${book.title.ifBlank { "this book" }}?")
             .setPositiveButton("Delete") { _, _ ->
-                Thread {
-                    val ok = StorageBridge.deleteEpub(this, book.uriString)
-                    runOnUiThread {
-                        if (ok) {
-                            viewModel.remove(book)
-                            syncBooks(viewModel.getBooksSnapshot())
-                            updateEmptyState()
-                            viewModel.saveLibrary()
-                            toast("Deleted")
-                        } else {
-                            showError("Delete failed")
-                        }
+                lifecycleScope.launch {
+                    try {
+                        LibraryBookMutations.run(applicationContext, book.uriString, expectedBookId = book.libraryId) { mutation -> mutation.delete() }
+                        viewModel.reloadFromStore()
+                        syncBooks(viewModel.getBooksSnapshot())
+                        updateEmptyState()
+                        toast("Deleted")
+                    } catch (e: Exception) {
+                        showError("Delete failed: ${e.message ?: e.javaClass.simpleName}")
                     }
-                }.start()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -618,62 +621,27 @@ class MainActivity : BaseActivity() {
 
     private fun scanManualEpubDir(folder: java.io.File) {
         toast("Scanning ${folder.absolutePath}...")
-        android.util.Log.d("FFF-Dup", "scanManualEpubDir start path=${folder.absolutePath}")
-        Thread {
-            val epubFiles = folder.listFiles()?.filter { file ->
-                file.isFile && file.extension.equals("epub", ignoreCase = true)
-            } ?: emptyList()
-            if (epubFiles.isEmpty()) {
-                runOnUiThread {
-                    showError("No EPUB files found in ${folder.absolutePath}")
-                }
-                return@Thread
-            }
-            val resultJson = pythonBridge?.scanEpubDir(folder.absolutePath)
-                ?: """{"ok":false,"error":"bridge missing"}"""
-            val result = json(resultJson)
-            runOnUiThread {
-                if (result?.optBoolean("ok") == true) {
-                    val books = result.optJSONArray("books") ?: org.json.JSONArray()
-                    android.util.Log.d("FFF-Dup", "scanManualEpubDir scannedCount=${books.length()}")
-                    val list = mutableListOf<BookItem>()
-                    val seen = mutableSetOf<String>()
-                    for (i in 0 until books.length()) {
-                        val b = books.getJSONObject(i)
-                        val path = b.optString("path", "")
-                        if (path.isNotBlank() && !seen.add(path)) continue
-                        list.add(
-                            BookItem(
-                                title = b.optString("title", "untitled"),
-                                author = b.optString("author", ""),
-                                uriString = path,
-                                lastModified = b.optLong("modified", 0L),
-                                sizeBytes = b.optLong("size", 0L),
-                                coverUriString = b.optString("cover", ""),
-                                url = b.optString("url", ""),
-                                chapters = b.optInt("chapters", 0)
-                            )
-                        )
-                    }
-                    list.sortByDescending { it.lastModified }
-                    for (book in list) {
-                        viewModel.addOrUpdate(book)
-                    }
-                    syncBooks(viewModel.getBooksSnapshot())
-                    updateEmptyState()
-                    toast("Loaded ${list.size} EPUBs")
-                    viewModel.saveLibrary()
-                } else {
-                    val errorMsg = result?.optString("error") ?: "unknown"
-                    android.util.Log.w("FFF-Dup", "scanManualEpubDir failed: $errorMsg")
-                    if (errorMsg.contains("not a zip", ignoreCase = true) || errorMsg.contains("zip", ignoreCase = true)) {
-                        showError("Scan issue: some files were not valid EPUBs. Showing existing library if available.")
-                    } else {
-                        showError("Scan failed: $errorMsg")
+        lifecycleScope.launch {
+            try {
+                val count = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    LibraryStorageGate.run {
+                        BookRepository.reconcileOrganisedPaths(applicationContext)
+                        val result = JSONObject(pythonBridge?.scanEpubDir(folder.absolutePath)
+                            ?: error("Bridge not available"))
+                        check(result.optBoolean("ok")) { result.optString("error", "Scan failed") }
+                        viewModel.importOrganisedLibrary(
+                            result.optJSONArray("books") ?: org.json.JSONArray())
                     }
                 }
+                viewModel.reloadFromStore()
+                syncBooks(viewModel.getBooksSnapshot())
+                updateEmptyState()
+                toast(if (count == 0) "No readable EPUBs found (including subfolders)" else "Loaded $count EPUBs")
+            } catch (e: Exception) {
+                showError("Scan failed: ${e.message}")
+                DiagnosticLog.appendException(applicationContext, "Library.Scan", "scan_failed", e)
             }
-        }.start()
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -894,49 +862,10 @@ class MainActivity : BaseActivity() {
             toast("No updatable books")
             return
         }
-        toast("Refreshing ${updatable.size} books...")
-        Thread {
-            var successCount = 0
-            var failCount = 0
-            for (book in updatable) {
-                val resultJson = StorageBridge.withLocalEpub(this, book.uriString) { localPath ->
-                    // Refresh-all walks the whole library back-to-back. Run every
-                    // update through the same engine gate as the download queue so a
-                    // refresh cannot burst the site (or collide with a queued job).
-                    FanFicFareGate.runBlocking {
-                        pythonBridge?.updateEpubFromPath(localPath.absolutePath, filesDir.absolutePath)
-                    }
-                }
-                if (resultJson == null) {
-                    failCount++
-                    continue
-                }
-                val result = json(resultJson)
-                if (result?.optBoolean("ok") == true) {
-                    successCount++
-                    val title = result.optString("title", book.title)
-                    val internalPath = result.optString("path", "")
-                    if (internalPath.isNotBlank()) {
-                        try {
-                            val source = File(internalPath)
-                            if (source.exists() && source.isFile) {
-                                val outputDir = SettingsActivity.getOutputDir(this@MainActivity)
-                                val finalPath = copyToOutputDir(source, outputDir)
-                                val author = result.optString("author", book.author)
-                                runOnUiThread { refreshBookPath(book, title, author, finalPath) }
-                            }
-                        } catch (e: Exception) {
-                            // ignore copy failures in batch mode
-                        }
-                    }
-                } else {
-                    failCount++
-                }
-            }
-            runOnUiThread {
-                toast("Refresh complete. Updated: $successCount, Failed: $failCount")
-                viewModel.saveLibrary()
-            }
-        }.start()
+        // Use the canonical worker path: it resolves the current Room path under
+        // LibraryStorageGate and replaces that exact file, including author folders.
+        // The old loop copied results back to the output root and rewrote the table.
+        for (book in updatable) viewModel.enqueueUpdate(book.libraryId, book.uriString)
+        toast("Queued updates for ${updatable.size} books. See Queue for progress.")
     }
 }

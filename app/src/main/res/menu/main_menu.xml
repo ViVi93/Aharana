@@ -24,6 +24,10 @@
         android:title="Load Library"
         app:showAsAction="never" />
     <item
+        android:id="@+id/action_organise_library"
+        android:title="Organise existing books"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/action_settings"
         android:title="Settings"
         app:showAsAction="never" />
