@@ -8,7 +8,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Chaquopy's buildPython points to /usr/bin/python3.12; Ubuntu 26 no
+    # longer supplies that interpreter. Keep the matching system-Python image.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

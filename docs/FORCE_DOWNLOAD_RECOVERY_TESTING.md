@@ -1,6 +1,6 @@
 # Force Download — recovery testing batch
 
-Original testing base: `d8df743351cd4e71579633772a8d86ebae7d9d08`, cumulative `1.15-debug` batch. The user subsequently authorized local commit and GitHub publication; the shipping version is `1.16`. The debug-artifact verification below records the pre-publication checkpoint. Phone checks remain pending and are not implied by publication.
+Original testing base: `d8df743351cd4e71579633772a8d86ebae7d9d08`, cumulative `1.15-debug` batch. The user subsequently authorized local commit and GitHub publication; the feature batch was committed as `1.16`. A CI compatibility follow-up uses `1.17`: Ubuntu's moving latest runner no longer supplies the configured `/usr/bin/python3.12`, so the workflow now selects Ubuntu 24.04. The debug-artifact verification below records the pre-publication checkpoint. Phone checks remain pending and are not implied by publication.
 
 ## Contract
 
