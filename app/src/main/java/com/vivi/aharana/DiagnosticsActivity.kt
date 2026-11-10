@@ -6,7 +6,11 @@ import android.net.Uri
 import android.os.Bundle
 import android.widget.TextView
 import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import com.chaquo.python.Python
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 class DiagnosticsActivity : BaseActivity() {
@@ -44,18 +48,25 @@ class DiagnosticsActivity : BaseActivity() {
             updateStatus()
         }
         findViewById<android.widget.Button>(R.id.buttonShareLog).setOnClickListener {
-            val file = DiagnosticLog.getFile(this)
-            if (!file.exists()) {
-                showMessage("No log yet")
-                return@setOnClickListener
+            val button = it
+            button.isEnabled = false
+            lifecycleScope.launch {
+                try {
+                    val file = withContext(Dispatchers.IO) { DiagnosticBundle.create(applicationContext) }
+                    val uri: Uri = FileProvider.getUriForFile(this@DiagnosticsActivity, "${packageName}.provider", file)
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = "application/zip"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(intent, "Share diagnostic bundle"))
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    DiagnosticLog.appendException(applicationContext, "Diagnostics.Export", "export_failed", e)
+                    showMessage("Could not export diagnostics: ${e.javaClass.simpleName}")
+                } finally { button.isEnabled = true }
             }
-            val uri: Uri = FileProvider.getUriForFile(this, "${packageName}.provider", file)
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(intent, "Share diagnostic log"))
         }
         findViewById<android.widget.Button>(R.id.buttonRunImportDiagnostics).setOnClickListener {
             runImportDiagnostics()
@@ -63,10 +74,9 @@ class DiagnosticsActivity : BaseActivity() {
     }
 
     private fun updateStatus() {
-        val python = if (Python.isStarted()) Python.getInstance() else null
-        val module = try { python?.getModule("fanficfare_bridge") } catch (e: Exception) { null }
-        statusText.text = "Python: ${if (python != null) "started" else "missing"}\n" +
-            "Module: ${if (module != null) "loaded" else "missing"}\n" +
+        // The export must remain usable even if a synchronous Python call holds the GIL.
+        statusText.text = "Python: ${if (Python.isStarted()) "started" else "missing"}\n" +
+            "Module: use Run import diagnostics to check\n" +
             "Log file: ${DiagnosticLog.getFile(this).absolutePath}"
         try {
             val info = packageManager.getPackageInfo(packageName, 0)
@@ -85,7 +95,7 @@ class DiagnosticsActivity : BaseActivity() {
                     logText.text = "No log entries"
                 } else {
                     if (result.totalCount > 30) {
-                        logText.text = result.lines + "\n\n(truncated to last 30 of ${result.totalCount} lines — use Share to export the full log)"
+                        logText.text = result.lines + "\n\n(last 30 of ${result.totalCount} current log lines — Share includes retained app/engine logs and queue state)"
                     } else {
                         logText.text = result.lines
                     }

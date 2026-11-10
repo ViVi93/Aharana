@@ -19,8 +19,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 # py2 vs py3 transition
-from .. import exceptions
+from .. import exceptions, diagnostics
 
+import email.utils
+import random
+import re
+import time
+from itertools import takewhile
+from urllib3.exceptions import InvalidHeader
 from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 import requests
@@ -34,6 +40,60 @@ from requests_file import FileAdapter
 
 from .log import make_log
 from .base_fetcher import FetcherResponse, Fetcher
+
+class BoundedRetry(Retry):
+    """Android safeguard: cap Retry-After on old and new urllib3 alike."""
+    def __init__(self, *args, retry_after_max=60, **kwargs):
+        # Do not pass the newer keyword to urllib3: older Android wheels reject
+        # it. The override below enforces the bound independently of version.
+        super().__init__(*args, **kwargs)
+        self.retry_after_max = retry_after_max
+
+    def _requested_retry_after(self, response):
+        value = response.headers.get('Retry-After')
+        if value is None:
+            return None
+        if re.fullmatch(r'\s*[0-9]+\s*', value):
+            return int(value)
+        parsed = email.utils.parsedate_tz(value)
+        if parsed is None:
+            # Do not include arbitrary server header content in this error.
+            raise InvalidHeader('Invalid Retry-After header')
+        return max(0, email.utils.mktime_tz(parsed) - time.time())
+
+    def get_retry_after(self, response):
+        delay = self._requested_retry_after(response)
+        return min(delay, self.retry_after_max) if delay is not None else None
+
+    def sleep(self, response=None):
+        # urllib3 clones Retry on every increment; history correlates the failed
+        # response with the upcoming attempt even on versions lacking the cap.
+        attempt = len(self.history) + 1
+        status = getattr(response, 'status', None)
+        error = self.history[-1].error if self.history else None
+        diagnostics.emit('request_retry', retry_attempt=max(1, attempt - 1),
+                         http_status=status, error_type=type(error).__name__ if error else None)
+        diagnostics.retry_attempt(attempt)
+        requested = self._requested_retry_after(response) if self.respect_retry_after_header and response is not None else None
+        if requested:
+            actual = min(requested, self.retry_after_max)
+            source = 'retry_after'
+        else:
+            count = len(list(takewhile(lambda entry: entry.redirect_location is None,
+                                      reversed(self.history))))
+            requested = self.backoff_factor * (2 ** (count - 1)) if count > 1 else 0
+            jitter = getattr(self, 'backoff_jitter', 0)
+            if requested and jitter:
+                requested += random.random() * jitter
+            actual = max(0, min(self.backoff_max, requested))
+            source = 'backoff'
+        diagnostics.timed_sleep(actual, source, requested=requested, sleep_fn=time.sleep,
+                                retry_attempt=attempt, http_status=status)
+
+    def new(self, **kwargs):
+        kwargs.setdefault('retry_after_max', self.retry_after_max)
+        return super().new(**kwargs)
+
 
 class RequestsFetcher(Fetcher):
     def __init__(self,getConfig_fn,getConfigList_fn):
@@ -61,7 +121,8 @@ class RequestsFetcher(Fetcher):
         ## reference, and old stories are full of them (postimg.org etc).
         ## FFF only logs "Failed to load or convert image ... skipping" at the
         ## end, so the download just looks frozen. One quick retry only.
-        return Retry(total=1,
+        return BoundedRetry(total=1,
+                     retry_after_max=2,
                      other=0,
                      backoff_factor=1,
                      backoff_max=2,
@@ -91,23 +152,14 @@ class RequestsFetcher(Fetcher):
         ## "Retry-After: 21600" could therefore park a whole story fetch - and,
         ## with the app's engine gate, the entire download queue - for hours.
         ## Cap the ladder and let the app-level retry decide instead.
-        try:
-            return Retry(total=total,
-                         other=0, # rather fail SSL errors/etc quick
-                         backoff_factor=2,# factor 2=4,8,16sec
-                         allowed_methods={'GET','POST'},
-                         status_forcelist=status_forcelist,
-                         raise_on_status=False, # to match w/o retries behavior
-                         backoff_max=10,
-                         retry_after_max=60)
-        except TypeError: # urllib3 without retry_after_max
-            return Retry(total=total,
-                         other=0,
-                         backoff_factor=2,
-                         allowed_methods={'GET','POST'},
-                         status_forcelist=status_forcelist,
-                         raise_on_status=False,
-                         backoff_max=10)
+        return BoundedRetry(total=total,
+                            other=0, # rather fail SSL errors/etc quick
+                            backoff_factor=2,
+                            allowed_methods={'GET','POST'},
+                            status_forcelist=status_forcelist,
+                            raise_on_status=False,
+                            backoff_max=10,
+                            retry_after_max=60)
 
     def make_sesssion(self):
         return requests.Session()
@@ -172,6 +224,7 @@ class RequestsFetcher(Fetcher):
     def use_verify(self):
         return not self.getConfig('use_ssl_unverified_context',False)
 
+    @diagnostics.request_call
     def request(self,method,url,headers=None,parameters=None,json=None):
         '''Returns a FetcherResponse regardless of mechanism'''
         if method not in ('GET','POST'):
@@ -186,7 +239,7 @@ class RequestsFetcher(Fetcher):
             raise requests.exceptions.ConnectionError(
                 "image host %s already failed in this session"%host)
         try:
-            logger.debug(make_log('RequestsFetcher',method,url,hit='REQ',bar='-'))
+            logger.debug('RequestsFetcher %s %s', method, diagnostics.safe_url(url))
             ## resp = requests Response object
             timeout = 60.0
             try:
@@ -205,6 +258,7 @@ class RequestsFetcher(Fetcher):
                 json=json,
                 verify=self.use_verify(),
                 timeout=timeout)
+            diagnostics.response_status(resp.status_code)
             logger.debug("response code:%s"%resp.status_code)
             resp.raise_for_status() # raises RequestsHTTPError if error code.
             # consider 'cached' if from file.
@@ -239,7 +293,8 @@ class RequestsFetcher(Fetcher):
             ## non-fatal and marks them 'failedtoload' in the EPUB.
             if is_image and host:
                 self.dead_image_hosts.add(host)
-                logger.debug("image host %s marked failed for this run: %s"%(host,e))
+                logger.debug('image host marked failed for this run: %s %s',
+                             diagnostics.safe_url(url).get('host', ''), type(e).__name__)
             raise
 
     def __del__(self):

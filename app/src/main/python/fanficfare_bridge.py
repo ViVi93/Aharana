@@ -22,34 +22,35 @@ from fanficfare_config import (
     _get_fanficfare_version as _cfg_get_fanficfare_version,
 )
 
+from fanficfare import diagnostics as _diagnostics
+
 _FANFICFARE_AVAILABLE = None
 _FANFICFARE_ERROR = None
 _FANFICFARE_TRACEBACK = None
-_DOWNLOAD_DEBUG_PATH = os.path.join(tempfile.gettempdir(), "fanficfare_download_debug.log")
 
 
 def _download_debug_write(line):
-    try:
-        with open(_DOWNLOAD_DEBUG_PATH, "a", encoding="utf-8") as f:
-            f.write("[{}] {}\n".format(time.strftime("%H:%M:%S"), line))
-    except Exception:
-        pass
+    # Retain the existing stage markers, not raw URLs/config/exception text.
+    words = line.split()
+    if len(words) > 1:
+        stage = words[1].split('=')[0]
+        if re.fullmatch(r'[A-Za-z_]+', stage):
+            elapsed = re.search(r'\belapsed=([0-9]+(?:\.[0-9]+)?)s\b', line)
+            fields = {'duration_ms': float(elapsed.group(1)) * 1000} if elapsed else {}
+            _diagnostics.emit('stage', stage=stage, **fields)
 
 
 def _download_debug_clear():
-    try:
-        with open(_DOWNLOAD_DEBUG_PATH, "w", encoding="utf-8") as f:
-            f.write("")
-    except Exception:
-        pass
+    _diagnostics.clear()
 
 
 def _download_debug_read():
-    try:
-        with open(_DOWNLOAD_DEBUG_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
+    return _diagnostics.read()
+
+
+def set_download_diagnostic_context(contextJson):
+    """One-shot, same-thread context for the next bridge operation attempt."""
+    return _diagnostics.set_context(contextJson)
 
 
 def _chapter_images_enabled(configuration, default=True):
@@ -198,6 +199,7 @@ def get_fanficfare_version():
 
 
 def set_config_dir(path):
+    _diagnostics.configure(path)
     try:
         _cfg_set_config_dir(path)
     except Exception:
@@ -315,6 +317,7 @@ def list_sites():
         return json.dumps({"ok": False, "error": str(e)})
 
 
+@_diagnostics.operation('metadata', url_argument=True)
 def get_metadata(url):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
@@ -333,43 +336,58 @@ def get_metadata(url):
         return json.dumps({"ok": False, "error": str(e), "exception_type": type(e).__name__, "http_status": _exception_http_status(e), "detail": traceback.format_exc()})
 
 
+def _bridge_chapter_outcome(adapter):
+    """Expose completed engine counters without implying a partial EPUB is complete."""
+    story = adapter.story
+    errors = int(story.chapter_error_count)
+    return {
+        "chapter_error_count": errors,
+        "warnings": (["{} chapter(s) could not be downloaded; the EPUB contains error placeholders. Retry the update to recover them.".format(errors)]
+                     if errors else []),
+        "chapter_added_count": int(story.chapter_added_count),
+        "chapter_updated_count": int(story.chapter_updated_count),
+        "chapter_written_count": int(story.chapter_written_count),
+    }
+
+
+@_diagnostics.operation('download', url_argument=True)
 def download_story(url, outDir):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
-    _download_debug_clear()
     try:
         _download_debug_write("download_story ENTER url={}".format(url))
         from fanficfare import adapters, writers
         _download_debug_write("download_story configuration_start")
-        t0 = time.time()
+        t0 = time.monotonic()
         ## Android patch: images are embedded by default (see
         ## _apply_image_setting) - <img> URLs from dead hosts now fail fast
         ## rather than costing the full retry ladder each (fetcher_requests).
         configuration = _apply_image_setting(build_configuration(url, "epub"))
-        _download_debug_write("download_story configuration_ready elapsed={:.3f}s".format(time.time() - t0))
+        _download_debug_write("download_story configuration_ready elapsed={:.3f}s".format(time.monotonic() - t0))
         try:
             cfg = configuration.get("defaults", "is_adult")
         except Exception:
             cfg = None
         _download_debug_write("download_story configuration_is_adult={}".format(cfg))
-        t0 = time.time()
+        t0 = time.monotonic()
         _download_debug_write("download_story adapter_start")
         adapter = adapters.getAdapter(configuration, url)
-        _download_debug_write("download_story adapter_ready elapsed={:.3f}s".format(time.time() - t0))
+        _download_debug_write("download_story adapter_ready elapsed={:.3f}s".format(time.monotonic() - t0))
         _download_debug_write("download_story writer_start")
-        t0 = time.time()
+        t0 = time.monotonic()
         writer = writers.getWriter("epub", configuration, adapter)
-        _download_debug_write("download_story writer_ready elapsed={:.3f}s".format(time.time() - t0))
+        _download_debug_write("download_story writer_ready elapsed={:.3f}s".format(time.monotonic() - t0))
         filename = writer.getOutputFileName()
         outpath = os.path.join(outDir, os.path.basename(filename))
         _download_debug_write("download_story fanficfare_call_start")
-        t0 = time.time()
+        t0 = time.monotonic()
         _write_story_to_output(writer, outpath)
-        _download_debug_write("download_story fanficfare_call_returned elapsed={:.3f}s".format(time.time() - t0))
+        _download_debug_write("download_story fanficfare_call_returned elapsed={:.3f}s".format(time.monotonic() - t0))
         stat = os.stat(outpath)
         meta = _extract_epub_metadata(outpath)
         _download_debug_write("download_story RETURN")
         return json.dumps({
+            **_bridge_chapter_outcome(adapter),
             "ok": True,
             "title": meta.get("title") or adapter.story.getMetadata("title") or filename,
             "author": meta.get("author") or adapter.story.getMetadata("author") or "",
@@ -691,69 +709,144 @@ def delete_epub(epubPath):
         return json.dumps({"ok": False, "error": str(e)})
 
 
+def _bridge_epubs_identical(original, candidate, writer=None):
+    """Prove equal payloads; a real writer can also prove packaging-clock churn."""
+    if writer is not None:
+        from epub_update_comparison import is_unchanged
+        return is_unchanged(original, candidate, writer, _bridge_epubs_identical)
+    with zipfile.ZipFile(original) as old, zipfile.ZipFile(candidate) as new:
+        if old.namelist() != new.namelist():
+            return False
+        for old_info, new_info in zip(old.infolist(), new.infolist()):
+            if old_info.file_size != new_info.file_size:
+                return False
+            with old.open(old_info) as left, new.open(new_info) as right:
+                while True:
+                    chunk = left.read(65536)
+                    if chunk != right.read(65536):
+                        return False
+                    if not chunk:
+                        break
+    return True
+
+
+@_diagnostics.operation('update')
 def update_epub_from_path(epubPath, outDir):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
     try:
-        from fanficfare.epubutils import get_update_data, get_dcsource_chaptercount
+        from fanficfare.epubutils import get_update_data
+        from fanficfare.updategate import decide_update
         from fanficfare import adapters, writers
         from fanficfare_config import build_configuration
-        source, chaptercount = get_update_data(epubPath)[0:2]
+        old_state = get_update_data(epubPath)
+        source, chaptercount = old_state[0:2]
         if not source:
             return json.dumps({"ok": False, "error": "No story URL found in epub"})
+        # Check before any equal-count decision: 0 == 0 is not a valid book.
+        if chaptercount == 0:
+            return json.dumps({"ok": False, "error": "existing epub has 0 recognizable chapters"})
         configuration = _apply_image_setting(build_configuration(source, "epub"))
         adapter = adapters.getAdapter(configuration, source)
         url, ch_begin, ch_end = adapters.get_url_chapter_range(source)
         adapter.setChaptersRange(ch_begin, ch_end)
-        adapter.getStoryMetadataOnly()
+        (adapter.oldchapters, adapter.oldimgs, adapter.oldcover,
+         adapter.calibrebookmark, adapter.logfile, adapter.oldchaptersmap,
+         adapter.oldchaptersdata) = old_state[2:9]
         urlchaptercount = adapter.getStoryMetadataOnly().getChapterCount()
-        if chaptercount == urlchaptercount:
-            return json.dumps({"ok": True, "skipped": True, "reason": "already current", "url": source, "chapters": chaptercount})
-        elif chaptercount > urlchaptercount:
-            return json.dumps({"ok": True, "skipped": True, "reason": "local has more chapters than source", "url": source, "chapters": chaptercount})
-        elif chaptercount == 0:
+        decision = decide_update(
+            chaptercount, urlchaptercount,
+            # Count equality cannot prove metadata, title or order equality.
+            # Assemble using cached chapters, then compare the actual EPUB.
+            updatealways=True,
+            needs_edit_check=adapter.recheck_recent_chapters(),
+            preserve_deleted=adapter.preserve_deleted_chapters(),
+        )
+        if decision == "no_chapters":
             return json.dumps({"ok": False, "error": "existing epub has 0 recognizable chapters"})
-        else:
-            (_,
-             _,
-             adapter.oldchapters,
-             adapter.oldimgs,
-             adapter.oldcover,
-             adapter.calibrebookmark,
-             adapter.logfile,
-             adapter.oldchaptersmap,
-             adapter.oldchaptersdata) = get_update_data(epubPath)[0:9]
-            writer = writers.getWriter("epub", configuration, adapter)
-            filename = writer.getOutputFileName()
-            outpath = os.path.join(outDir, os.path.basename(filename))
-            _write_story_to_output(writer, outpath, metaonly=False)
-            stat = os.stat(outpath)
-            meta = _extract_epub_metadata(outpath)
-            return json.dumps({
-                "ok": True,
-                "title": meta.get("title") or adapter.story.getMetadata("title") or filename,
-                "author": meta.get("author") or adapter.story.getMetadata("author") or "",
-                "chapters": meta.get("chapters") or adapter.story.getChapterCount() or 0,
-                "cover": meta.get("cover") or "",
-                "url": source,
-                "path": outpath,
-                "modified": int(stat.st_mtime * 1000),
-                "size": stat.st_size,
-            })
+        if decision == "more_than_source":
+            return json.dumps({"ok": True, "skipped": True,
+                               "reason": "local has more chapters than source",
+                               "url": source, "chapters": chaptercount,
+                               "chapter_error_count": 0, "warnings": []})
+        if urlchaptercount == 0:
+            return json.dumps({"ok": False, "error": "source has 0 recognizable chapters"})
+        writer = writers.getWriter("epub", configuration, adapter)
+        filename = writer.getOutputFileName()
+        outpath = os.path.join(outDir, os.path.basename(filename))
+        # Keep the existing destination intact until all content/metadata has
+        # been assembled and compared. In particular, outpath may be epubPath.
+        fd, candidate = tempfile.mkstemp(dir=outDir, prefix=".fff-update-", suffix=".epub.part")
+        os.close(fd)
+        try:
+            _write_story_to_output(writer, candidate, metaonly=False)
+            outcome = _bridge_chapter_outcome(adapter)
+            if not outcome['chapter_error_count'] and _bridge_epubs_identical(epubPath, candidate, writer):
+                return json.dumps({"ok": True, "skipped": True,
+                                   "reason": "already current", "url": source,
+                                   "chapters": chaptercount, **outcome})
+            os.replace(candidate, outpath)
+        finally:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        stat = os.stat(outpath)
+        meta = _extract_epub_metadata(outpath)
+        return json.dumps({
+            **outcome,
+            "ok": True,
+            "title": meta.get("title") or adapter.story.getMetadata("title") or filename,
+            "author": meta.get("author") or adapter.story.getMetadata("author") or "",
+            "chapters": meta.get("chapters") or adapter.story.getChapterCount() or 0,
+            "cover": meta.get("cover") or "",
+            "url": source,
+            "path": outpath,
+            "modified": int(stat.st_mtime * 1000),
+            "size": stat.st_size,
+        })
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e), "exception_type": type(e).__name__, "http_status": _exception_http_status(e)})
 
 
-def force_download_from_epub(epubPath, outDir):
+def _valid_force_fallback_url(url):
+    """Validate the stored URL as supplied; never repair whitespace/userinfo."""
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or not url or any(
+            c.isspace() or ord(c) < 32 or ord(c) == 127 or c == '\\' for c in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+                and parsed.username is None and parsed.password is None
+                and (parsed.port is None or 0 <= parsed.port <= 65535))
+    except ValueError:
+        return False
+
+
+@_diagnostics.operation('force_download')
+def force_download_from_epub(epubPath, outDir, fallbackUrl=None):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
     try:
         from fanficfare.epubutils import get_update_data
         from fanficfare import adapters, writers
         from fanficfare_config import build_configuration
-        source = get_update_data(epubPath)[0]
-        if not source:
-            return json.dumps({"ok": False, "error": "No story URL found in epub"})
+        # Only local extraction may fall back. Adapter/network/writer failures
+        # below must keep their original outcome and must never start again.
+        source_error = None
+        try:
+            source = get_update_data(epubPath)[0]
+        except Exception as exc:
+            source = None
+            source_error = re.sub(r'[^A-Za-z0-9_]', '_', type(exc).__name__)[:80]
+        if not source or not source.strip():
+            valid_fallback = _valid_force_fallback_url(fallbackUrl)
+            _diagnostics.emit('force_source_fallback', stage='local_source',
+                              outcome='stored_url' if valid_fallback else 'no_usable_url',
+                              reason='source_extraction_failed' if source_error else 'source_missing',
+                              exception_type=source_error)
+            if not valid_fallback:
+                return json.dumps({"ok": False, "error": "No usable story URL: EPUB unreadable or source missing, and no valid stored HTTP(S) URL."})
+            source = fallbackUrl
         configuration = _apply_image_setting(build_configuration(source, "epub"))
         adapter = adapters.getAdapter(configuration, source)
         url, ch_begin, ch_end = adapters.get_url_chapter_range(source)
@@ -780,6 +873,7 @@ def force_download_from_epub(epubPath, outDir):
         out_size_after = stat.st_size
         out_mtime_after = int(stat.st_mtime * 1000)
         return json.dumps({
+            **_bridge_chapter_outcome(adapter),
             "ok": True,
             "title": meta.get("title") or adapter.story.getMetadata("title") or filename,
             "author": meta.get("author") or adapter.story.getMetadata("author") or "",
@@ -895,24 +989,32 @@ def _canonical_dedupe_key(url):
     return lowered
 
 
+def _bridge_discovery_result(result):
+    """Only supported UI fields cross JSON; raw series storydata contains dates."""
+    result = result if isinstance(result, dict) else {}
+    urls = [url for url in (result.get("urllist") or []) if isinstance(url, str) and url]
+    unique = _dedupe_urls(urls)
+    payload = {"urllist": unique, "duplicates_removed": len(urls) - len(unique)}
+    for key in ("name", "desc", "status"):
+        if result.get(key) is not None:
+            payload[key] = str(result[key])
+    return payload
+
+
 def list_story_urls(page_url, normalize=False):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
     try:
-        from fanficfare.geturls import get_urls_from_page
+        from fanficfare.geturls import GetURLs
         from fanficfare_config import build_configuration
         _download_debug_write("list_story_urls START url={} normalize={}".format(page_url, normalize))
         configuration = build_configuration(page_url, "epub")
-        result = get_urls_from_page(page_url, configuration=configuration, normalize=normalize)
-        if not isinstance(result, dict):
-            result = {}
-        urls = result.get('urllist', []) or []
-        urls = _dedupe_urls(urls)
-        payload = {"ok": True}
-        payload.update(result)
-        payload['urllist'] = urls
-        payload['duplicates_removed'] = len(result.get('urllist', []) or []) - len(urls)
-        _download_debug_write("list_story_urls RETURN count={} deduped_from={}".format(len(urls), len(result.get('urllist', []) or [])))
+        getter = GetURLs(config=configuration,
+                         get_config=lambda url: build_configuration(url, "epub"))
+        result = getter.get_urls_from_page(page_url, normalize=normalize)
+        payload = {"ok": True, **_bridge_discovery_result(result)}
+        _download_debug_write("list_story_urls RETURN count={} duplicates_removed={}".format(
+            len(payload['urllist']), payload['duplicates_removed']))
         return json.dumps(payload)
     except Exception as e:
         _download_debug_write("list_story_urls EXCEPTION {}: {}".format(type(e).__name__, e))
@@ -927,17 +1029,17 @@ def download_story_list(page_url):
     if not _import_fanficfare():
         return json.dumps({"ok": False, "error": "FanFicFare not available", "detail": _FANFICFARE_ERROR or ""})
     try:
-        from fanficfare.geturls import get_urls_from_page
+        from fanficfare.geturls import GetURLs
         from fanficfare_config import build_configuration
         _download_debug_write("download_story_list START url={}".format(page_url))
         configuration = build_configuration(page_url, "epub")
-        result = get_urls_from_page(page_url, configuration=configuration, normalize=False)
-        if not isinstance(result, dict):
-            result = {}
-        urls = _dedupe_urls(result.get('urllist', []) or [])
+        getter = GetURLs(config=configuration,
+                         get_config=lambda url: build_configuration(url, "epub"))
+        result = _bridge_discovery_result(getter.get_urls_from_page(page_url, normalize=False))
+        urls = result['urllist']
         if not urls:
             _download_debug_write("download_story_list RETURN no_urls")
-            return json.dumps({"ok": True, "count": 0, "stories": []})
+            return json.dumps({"ok": True, **result, "count": 0, "errors": 0, "stories": []})
         stories = []
         errors = 0
         for url in urls:
@@ -957,7 +1059,7 @@ def download_story_list(page_url):
                 stories.append({"url": url, "title": "", "chapters": 0})
                 errors += 1
         _download_debug_write("download_story_list RETURN count={} errors={}".format(len(stories), errors))
-        return json.dumps({"ok": True, "count": len(stories), "errors": errors, "stories": stories})
+        return json.dumps({"ok": True, **result, "count": len(stories), "errors": errors, "stories": stories})
     except Exception as e:
         _download_debug_write("download_story_list EXCEPTION {}: {}".format(type(e).__name__, e))
         return json.dumps({"ok": False, "error": str(e), "detail": "{}: {}".format(type(e).__name__, e)})
@@ -1374,10 +1476,37 @@ def get_story_details(epub_path):
                            "error": "EPUB story details could not be read."})
 
 
+def _report_library_facet_failure(epub_path, stage, exc):
+    """Keep the real failure class/errno, never arbitrary XML, credential or path text."""
+    try:
+        import hashlib
+        reason = 'metadata_read_failed'
+        if isinstance(exc, FileNotFoundError):
+            reason = 'file_missing'
+        elif isinstance(exc, PermissionError):
+            reason = 'permission_denied'
+        elif isinstance(exc, zipfile.BadZipFile):
+            reason = 'invalid_zip'
+        elif isinstance(exc, ET.ParseError):
+            reason = 'invalid_xml'
+        elif isinstance(exc, ImportError):
+            reason = 'reader_import_failed'
+        elif isinstance(exc, ValueError) and str(exc) in ('Missing OPF', 'Missing metadata'):
+            reason = 'missing_opf' if str(exc) == 'Missing OPF' else 'missing_metadata'
+        _diagnostics.emit('library_facets_read_failed', stage=stage,
+                          epub_key=hashlib.sha256(str(epub_path).encode('utf-8')).hexdigest()[:12],
+                          exception_type=type(exc).__name__[:80], reason=reason,
+                          errno=getattr(exc, 'errno', None))
+    except Exception:
+        pass
+
+
 def get_library_facets(epub_path):
     """Read saved library filter values offline, without modifying the EPUB."""
     try:
         from library_facets import get_library_facets as read_facets
-        return json.dumps(read_facets(epub_path))
-    except Exception:
+        return json.dumps(read_facets(epub_path, on_error=lambda stage, exc:
+                                     _report_library_facet_failure(epub_path, stage, exc)))
+    except Exception as exc:
+        _report_library_facet_failure(epub_path, 'bridge', exc)
         return json.dumps({"ok": False, "error": "Saved book filters could not be read."})

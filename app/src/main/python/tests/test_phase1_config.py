@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,8 +18,9 @@ class SetConfigDirTest(unittest.TestCase):
         config._ANDROID_CONFIG_DIR = self.original
 
     def test_explicit_config_dir_changes_personal_ini_path(self):
-        target = "/tmp/android_config_test"
-        os.makedirs(target, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="android-config-", dir=os.environ['TMPDIR'])
+        self.addCleanup(temporary.cleanup)
+        target = temporary.name
         config.set_config_dir(target)
         self.assertEqual(
             config.get_personal_ini_path(),
@@ -36,8 +38,9 @@ class SetConfigDirTest(unittest.TestCase):
 class ConfigStatusTest(unittest.TestCase):
     def setUp(self):
         self.original = config._ANDROID_CONFIG_DIR
-        self.target = "/tmp/android_config_test_phase1"
-        os.makedirs(self.target, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="android-config-status-", dir=os.environ['TMPDIR'])
+        self.addCleanup(temporary.cleanup)
+        self.target = temporary.name
         config.set_config_dir(self.target)
 
     def tearDown(self):
@@ -75,8 +78,9 @@ class ConfigStatusTest(unittest.TestCase):
 class BuildConfigurationTest(unittest.TestCase):
     def setUp(self):
         self.original = config._ANDROID_CONFIG_DIR
-        self.target = "/tmp/android_config_test_phase1_build"
-        os.makedirs(self.target, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="android-config-build-", dir=os.environ['TMPDIR'])
+        self.addCleanup(temporary.cleanup)
+        self.target = temporary.name
         config.set_config_dir(self.target)
 
     def tearDown(self):
@@ -99,8 +103,9 @@ class BuildConfigurationTest(unittest.TestCase):
 
 class CredentialExposureTest(unittest.TestCase):
     def test_status_does_not_expose_credential_values(self):
-        target = "/tmp/android_config_test_phase1_creds"
-        os.makedirs(target, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="android-config-privacy-", dir=os.environ['TMPDIR'])
+        self.addCleanup(temporary.cleanup)
+        target = temporary.name
         original = config._ANDROID_CONFIG_DIR
         config.set_config_dir(target)
         try:

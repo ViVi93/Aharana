@@ -52,6 +52,7 @@ class AddFromPageActivity : BaseActivity() {
     private var fetchJob: Job? = null
     private var metadataJob: Job? = null
     private var previewJob: Job? = null
+    private var metadataResultJob: Job? = null
     private var busy = false
     private var sourceLabel = ""
     private var metadataPaused = false
@@ -127,7 +128,7 @@ class AddFromPageActivity : BaseActivity() {
             DiagnosticLog.appendException(this, "BulkImport", "bridge_init_failed", e)
             status("Python unavailable: ${e.message}")
         }
-        repository = BookRepository(this)
+        repository = BookRepository.getInstance(this)
         viewModel = ViewModelProvider(this, ViewModelFactory(repository))[LibraryViewModel::class.java]
         restorePreviewState()
         intent?.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotBlank() }?.let {
@@ -371,19 +372,32 @@ class AddFromPageActivity : BaseActivity() {
     private fun applyMetadataResults(jobs: List<com.vivi.aharana.data.local.DownloadJobEntity>) {
         val latest = jobs.filter { it.type == "metadata" && !it.inputUrl.isNullOrBlank() }
             .groupBy { it.inputUrl!! }.mapValues { it.value.maxByOrNull { job -> job.createdAt }!! }
-        var changed = false
-        // Always derive from CURRENT rows, never a snapshot captured before a checkbox click.
-        val rows = adapter.currentList.map { item ->
-            val job = latest[item.url]
-            if (item.title.isBlank() && job?.status == "success") {
-                val meta = safeJson(job.resultJson)
-                if (meta?.optBoolean("ok") == true) {
-                    changed = true
-                    item.copy(title = meta.optString("title").ifBlank { item.url }, chapters = meta.optInt("chapters"))
-                } else item
-            } else item
+        metadataResultJob?.cancel()
+        val pending = adapter.currentList.filter { it.title.isBlank() }
+            .mapNotNull { latest[it.url]?.takeIf { job -> job.status == "success" } }.distinctBy { it.id }
+        if (pending.isEmpty()) return
+        metadataResultJob = lifecycleScope.launch {
+            try {
+                // One bounded summary at a time; the process-owned observer never retains covers.
+                for (job in pending) {
+                    val meta = QueueHistory.metadataPreview(repository.jobDao, job.id) ?: continue
+                    if (!meta.optBoolean("ok")) continue
+                    var changed = false
+                    // Apply to CURRENT rows, retaining checkbox changes and respecting Clear.
+                    val rows = adapter.currentList.map { item ->
+                        if (item.url == job.inputUrl && item.title.isBlank()) {
+                            changed = true
+                            item.copy(title = meta.optString("title").ifBlank { item.url }, chapters = meta.optInt("chapters"))
+                        } else item
+                    }
+                    if (changed) { adapter.submitList(rows); savePreviewState() }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                DiagnosticLog.appendException(this@AddFromPageActivity, "BulkMetadata", "preview_read_failed", e)
+            }
         }
-        if (changed) { adapter.submitList(rows); savePreviewState() }
     }
 
     private fun startLazyMetadata() {

@@ -10,11 +10,25 @@ import android.widget.TextView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.documentfile.provider.DocumentFile
+import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
+import com.chaquo.python.Python
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executor
 
 class SettingsActivity : BaseActivity() {
     private val REQUEST_OUTPUT_DIR = 1001
     private val REQUEST_PERSONAL_INI = 1002
+    private val delivery = Executor { command ->
+        runOnUiThread { if (!isFinishing && !isDestroyed) command.run() }
+    }
+    // Independent lanes: Python can stall without blocking preview or bundle export.
+    private val configRequests = SettingsRequests(delivery)
+    private val previewRequests = SettingsRequests(delivery)
+    private val dnsRequests = SettingsRequests(delivery)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,84 +98,24 @@ class SettingsActivity : BaseActivity() {
             refreshPythonDebugLog()
         }
         findViewById<Button>(R.id.buttonClearPythonDebug).setOnClickListener {
-            val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-            try { bridge?.clearDownloadDebug() } catch (e: Exception) { /* ignore */ }
-            refreshPythonDebugLog()
-            showMessage("Debug log cleared")
+            clearPythonDebugLog()
         }
-
+        findViewById<Button>(R.id.buttonShareSettingsDiagnostics).setOnClickListener {
+            shareDiagnosticBundle()
+        }
         findViewById<Button>(R.id.buttonRunDnsDiagnostics).setOnClickListener {
-            val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-            val textView = findViewById<TextView>(R.id.textDnsDiagnostics)
-            textView.text = "Running..."
-            DiagnosticLog.append(this, "Settings.DnsDiagnostics", "button_clicked")
-            Thread {
-                var display = "DNS diagnostics unavailable"
-                val startedMs = System.currentTimeMillis()
-                try {
-                    DiagnosticLog.append(this, "Settings.DnsDiagnostics", "thread_start")
-                    val raw = try { bridge?.runDnsDiagnostics() } catch (e: Exception) { null }
-                    DiagnosticLog.append(this, "Settings.DnsDiagnostics", "bridge_returned raw=${raw != null}")
-                    if (raw == null) {
-                        display = "DNS diagnostics failed: bridge returned null"
-                        DiagnosticLog.append(this, "Settings.DnsDiagnostics", "result=null")
-                    } else {
-                        val obj = org.json.JSONObject(raw)
-                        if (obj.optBoolean("ok")) {
-                            val sb = StringBuilder()
-                            val target = obj.optJSONObject("target")
-                            val comparison = obj.optJSONObject("comparison")
-                            sb.append("Target: ").append(target?.optString("host") ?: "<null>").append('\n')
-                            sb.append("Repeated 5 attempts:\n")
-                            val targetResults = target?.optJSONArray("repeated_5") ?: org.json.JSONArray()
-                            var targetSuccess = 0
-                            var targetFail = 0
-                            for (i in 0 until targetResults.length()) {
-                                val r = targetResults.getJSONObject(i)
-                                if (r.optBoolean("success")) targetSuccess++ else targetFail++
-                            }
-                            sb.append("  success=").append(targetSuccess).append(" fail=").append(targetFail).append('\n')
-                            sb.append("Comparison: ").append(comparison?.optString("host") ?: "<null>").append('\n')
-                            sb.append("Repeated 5 attempts:\n")
-                            val compResults = comparison?.optJSONArray("repeated_5") ?: org.json.JSONArray()
-                            var compSuccess = 0
-                            var compFail = 0
-                            for (i in 0 until compResults.length()) {
-                                val r = compResults.getJSONObject(i)
-                                if (r.optBoolean("success")) compSuccess++ else compFail++
-                            }
-                            sb.append("  success=").append(compSuccess).append(" fail=").append(compFail).append('\n')
-                            val firstFail = targetResults.optJSONObject(targetResults.length() - 1)
-                            if (firstFail != null && !firstFail.optBoolean("success")) {
-                                sb.append("Last failure:\n")
-                                sb.append("  exception=").append(firstFail.optString("exception", "<null>")).append('\n')
-                                sb.append("  errno=").append(firstFail.optInt("errno")).append('\n')
-                                sb.append("  msg=").append(firstFail.optString("msg", "<null>")).append('\n')
-                            }
-                            display = sb.toString()
-                            DiagnosticLog.append(this, "Settings.DnsDiagnostics", "result=ok targetSuccess=${targetSuccess} targetFail=${targetFail}")
-                        } else {
-                            display = "DNS diagnostics failed: ${obj.optString("error", "<null>")}"
-                            DiagnosticLog.append(this, "Settings.DnsDiagnostics", "result=error")
-                        }
-                    }
-                } catch (e: Exception) {
-                    display = "DNS diagnostics unavailable: ${e.javaClass.simpleName}: ${e.message}"
-                    DiagnosticLog.appendException(this, "Settings.DnsDiagnostics", "ui_exception", e)
-                } finally {
-                    val elapsedMs = System.currentTimeMillis() - startedMs
-                    DiagnosticLog.append(this, "Settings.DnsDiagnostics", "thread_end elapsedMs=${elapsedMs}")
-                }
-                val finalDisplay = display
-                runOnUiThread {
-                    textView.text = finalDisplay
-                    DiagnosticLog.append(this, "Settings.DnsDiagnostics", "ui_updated")
-                }
-            }.start()
+            runDnsDiagnostics()
         }
 
         refreshPythonDebugLog()
         updateConfigStatus()
+    }
+
+    override fun onDestroy() {
+        configRequests.close()
+        previewRequests.close()
+        dnsRequests.close()
+        super.onDestroy()
     }
 
     private fun setupThemeSelector(prefs: android.content.SharedPreferences) {
@@ -268,75 +222,120 @@ class SettingsActivity : BaseActivity() {
     }
 
     private fun importPersonalIni(uri: android.net.Uri) {
-        try {
-            val dest = File(getConfigDir(this), "personal.ini")
-            contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output ->
-                    input.copyTo(output)
+        runConfigWork("personal.ini imported") {
+            val dest = File(getConfigDir(applicationContext), "personal.ini")
+            val staged = File.createTempFile("personal-import-", ".ini", dest.parentFile)
+            try {
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw java.io.IOException("Cannot open selected configuration")
+                input.use {
+                    staged.outputStream().use { output -> it.copyTo(output) }
                 }
+                check(staged.renameTo(dest)) { "Cannot store selected configuration" }
+            } finally {
+                staged.delete()
             }
-            if (dest.exists()) {
-                showMessage("personal.ini imported")
-                val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-                bridge?.initialize(getConfigDir(this).absolutePath)
-                updateConfigStatus()
-            } else {
-                showMessage("Import failed")
-            }
-        } catch (e: Exception) {
-            showMessage("Import error: ${e.javaClass.simpleName}")
         }
     }
 
     private fun removePersonalIni() {
-        try {
-            val file = File(getConfigDir(this), "personal.ini")
-            if (file.exists()) file.delete()
-            showMessage("personal.ini removed")
-            val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-            bridge?.initialize(getConfigDir(this).absolutePath)
-            updateConfigStatus()
-        } catch (e: Exception) {
-            showMessage("Remove error: ${e.javaClass.simpleName}")
+        runConfigWork("personal.ini removed") {
+            val file = File(getConfigDir(applicationContext), "personal.ini")
+            check(!file.exists() || file.delete()) { "Cannot remove configuration" }
         }
+    }
+
+    private fun engineLogFiles(): List<File> {
+        val directory = File(getConfigDir(applicationContext), "diagnostics")
+        return (listOf("engine.jsonl") + (1..3).map { "engine.jsonl.$it" })
+            .map { File(directory, it) }
     }
 
     private fun refreshPythonDebugLog() {
         val textView = findViewById<TextView>(R.id.textPythonDebugLog)
-        val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-        val raw = try { bridge?.readDownloadDebug() } catch (e: Exception) { null }
-        val log = try {
-            val obj = org.json.JSONObject(raw ?: "{}")
-            if (obj.optBoolean("ok")) obj.optString("log", "No log yet") else "Debug unavailable"
-        } catch (e: Exception) {
-            "Debug unavailable"
+        textView.text = "Loading latest debug entries…"
+        previewRequests.submit({ SettingsDebugPreview.read(engineLogFiles()) }) { result ->
+            textView.text = result.fold(
+                onSuccess = { it.text.ifBlank { "No log yet" } },
+                onFailure = { "Debug unavailable: ${it.javaClass.simpleName}. Try Refresh or Share full diagnostics." }
+            )
         }
-        textView.text = if (log.isBlank()) "No log yet" else log
     }
 
+    private fun clearPythonDebugLog() {
+        val textView = findViewById<TextView>(R.id.textPythonDebugLog)
+        textView.text = "Clearing debug log…"
+        previewRequests.submit({
+            val result = JSONObject(settingsBridge().clearDownloadDebug())
+            check(result.optBoolean("ok")) { "Debug clear failed" }
+            SettingsDebugPreview.read(engineLogFiles())
+        }) { result ->
+            result.fold(onSuccess = {
+                textView.text = it.text.ifBlank { "No log yet" }
+                showMessage("Debug log cleared")
+            }, onFailure = {
+                textView.text = "Debug unavailable: clear failed (${it.javaClass.simpleName}). Logs may still be retained."
+            })
+        }
+    }
+
+    /** Only called inside SettingsRequests workers, never while binding views. */
+    private fun settingsBridge(): PythonBridge {
+        synchronized(Python::class.java) {
+            if (!Python.isStarted()) {
+                Python.start(com.chaquo.python.android.AndroidPlatform(applicationContext))
+            }
+        }
+        val bridge = PythonBridge(applicationContext)
+        check(bridge.getInitError() == null) { "Python bridge initialization failed" }
+        return bridge
+    }
+
+    private data class ConfigDisplay(val text: String, val exists: Boolean)
+
     private fun updateConfigStatus() {
+        runConfigWork()
+    }
+
+    private fun runConfigWork(successMessage: String? = null, mutation: () -> Unit = {}) {
         val statusText = findViewById<TextView>(R.id.textConfigStatus)
         val buttonRemove = findViewById<Button>(R.id.buttonRemoveConfig)
-        val bridge = try { PythonBridge(this) } catch (e: Exception) { null }
-        val status = bridge?.getConfigStatus()
-        DiagnosticLog.append(this, "Settings.ConfigStatus", status?.toString() ?: "null")
+        statusText.text = "Loading configuration…"
+        buttonRemove.isEnabled = false
+        configRequests.submit({
+            mutation()
+            // A failed Python status lookup must not prevent removing a broken INI.
+            val exists = File(getConfigDir(applicationContext), "personal.ini").isFile
+            try {
+                loadConfigStatus()
+            } catch (e: Exception) {
+                ConfigDisplay("Configuration unavailable: ${e.javaClass.simpleName}. You can import or remove personal.ini and retry.", exists)
+            }
+        }) { result ->
+            result.fold(onSuccess = {
+                statusText.text = it.text
+                buttonRemove.isEnabled = it.exists
+                if (successMessage != null) showMessage(successMessage)
+            }, onFailure = {
+                statusText.text = "Configuration unavailable: operation failed (${it.javaClass.simpleName}). Retry import or reopen Settings."
+                buttonRemove.isEnabled = true
+                showMessage("Configuration operation failed: ${it.javaClass.simpleName}")
+            })
+        }
+    }
 
-        val initialized = status?.optBoolean("initialized") == true
-        val configDir = status?.optString("config_dir", "") ?: ""
-        val personalPath = status?.optString("personal_ini_path", "") ?: ""
-        val exists = status?.optBoolean("exists") == true
-        val isFile = status?.optBoolean("is_file") == true
-        val size = status?.optInt("size", 0) ?: 0
-        val modified = status?.optLong("modified", 0) ?: 0L
-        val parseError = if (status?.has("parse_error") == true) status.optString("parse_error", "") else ""
-        val personalExists = status?.optBoolean("imported") ?: false
-        val personalIsFile = status?.optBoolean("is_file") ?: false
-        val resolvedSize = status?.optInt("size", 0) ?: 0
-        val storiesUsername = if (status?.has("storiesonline_section_username") == true) status.optString("storiesonline_section_username", "") else ""
-        val storiesPasswordPresent = status?.optBoolean("storiesonline_section_password_present") ?: false
-        val alwaysLogin = if (status?.has("always_login") == true) status.optString("always_login", "") else ""
-        val loginAttempted = status?.optBoolean("login_test_attempted") ?: false
-        val loginError = if (status?.has("login_test_error") == true) status.optString("login_test_error", "") else ""
+    private fun loadConfigStatus(): ConfigDisplay {
+        val status = settingsBridge().getConfigStatus()
+        check(!status.has("error") && status.optBoolean("initialized")) { "Configuration status failed" }
+
+        val initialized = status.optBoolean("initialized")
+        val configDir = status.optString("config_dir", "")
+        val personalPath = status.optString("personal_ini_path", "")
+        val exists = status.optBoolean("exists")
+        val isFile = status.optBoolean("is_file")
+        val parseError = if (status.has("parse_error")) status.optString("parse_error", "") else ""
+        val personalExists = status.optBoolean("imported")
+        val resolvedSize = status.optInt("size", 0)
 
         val sb = StringBuilder()
         sb.append("Initialized: ").append(initialized).append('\n')
@@ -349,15 +348,86 @@ class SettingsActivity : BaseActivity() {
         if (!parseError.isNullOrBlank()) {
             sb.append("Parse error: ").append(parseError).append('\n')
         }
-        sb.append("Credentials present: ").append(status?.optBoolean("credentials_present") ?: false).append('\n')
-        sb.append("Configuration valid: ").append(status?.optBoolean("configuration_valid") ?: false).append('\n')
-        val importError = status?.optString("import_error", "") ?: ""
+        sb.append("Credentials present: ").append(status.optBoolean("credentials_present")).append('\n')
+        sb.append("Configuration valid: ").append(status.optBoolean("configuration_valid")).append('\n')
+        val importError = status.optString("import_error", "")
         if (importError.isNotBlank()) {
             sb.append("Import error: ").append(importError).append('\n')
         }
-        sb.append("FanFicFare version: ").append(if (status?.has("fanficfare_version") == true) status.optString("fanficfare_version", "<NULL>") else "<NULL>").append('\n')
-        statusText.text = sb.toString().trimEnd()
-        buttonRemove.isEnabled = exists
+        sb.append("FanFicFare version: ").append(if (status.has("fanficfare_version")) status.optString("fanficfare_version", "<NULL>") else "<NULL>").append('\n')
+        return ConfigDisplay(sb.toString().trimEnd(), exists)
+    }
+
+    private fun runDnsDiagnostics() {
+        val textView = findViewById<TextView>(R.id.textDnsDiagnostics)
+        textView.text = "Running…"
+        dnsRequests.submit({
+            val started = System.currentTimeMillis()
+            try {
+                DiagnosticLog.append(applicationContext, "Settings.DnsDiagnostics", "START")
+                val result = JSONObject(settingsBridge().runDnsDiagnostics())
+                if (!result.optBoolean("ok")) {
+                    "DNS diagnostics failed: " + DiagnosticFiles.sanitize(result.optString("error", "Unknown error")).take(1024)
+                } else {
+                    val display = StringBuilder()
+                    for ((label, key) in listOf("Target" to "target", "Comparison" to "comparison")) {
+                        val group = result.optJSONObject(key)
+                        val attempts = group?.optJSONArray("repeated_5") ?: org.json.JSONArray()
+                        var success = 0
+                        for (i in 0 until attempts.length()) {
+                            if (attempts.optJSONObject(i)?.optBoolean("success") == true) success++
+                        }
+                        display.append("$label: ${group?.optString("host") ?: "<null>"}\n")
+                        display.append("Repeated 5 attempts:\n  success=$success fail=${attempts.length() - success}\n")
+                        if (key == "target") {
+                            val last = attempts.optJSONObject(attempts.length() - 1)
+                            if (last != null && !last.optBoolean("success")) {
+                                display.append("Last failure:\n  exception=${last.optString("exception")}\n")
+                                display.append("  errno=${last.optInt("errno")}\n  msg=${last.optString("msg")}\n")
+                            }
+                        }
+                    }
+                    DiagnosticFiles.sanitize(display.toString()).take(8192)
+                }
+            } catch (e: Exception) {
+                DiagnosticLog.append(applicationContext, "Settings.DnsDiagnostics", "FAILED type=${e.javaClass.simpleName}")
+                throw e
+            } finally {
+                DiagnosticLog.append(applicationContext, "Settings.DnsDiagnostics", "END elapsedMs=${System.currentTimeMillis() - started}")
+            }
+        }) { result ->
+            textView.text = result.getOrElse { "DNS diagnostics unavailable: ${it.javaClass.simpleName}" }
+        }
+    }
+
+    private fun shareDiagnosticBundle() {
+        val button = findViewById<Button>(R.id.buttonShareSettingsDiagnostics)
+        val status = findViewById<TextView>(R.id.textSettingsExportStatus)
+        button.isEnabled = false
+        status.text = "Preparing retained diagnostics…"
+        // DiagnosticBundle switches to IO itself; no Python, GIL or engine gate involved.
+        lifecycleScope.launch {
+            try {
+                val file = DiagnosticBundle.create(applicationContext)
+                if (isFinishing || isDestroyed) return@launch
+                val uri = FileProvider.getUriForFile(this@SettingsActivity, "${packageName}.provider", file)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(Intent.createChooser(intent, "Share diagnostic bundle"))
+                status.text = "Bundle ready: retained app/engine logs and queue state (not just this preview)."
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                if (!isFinishing && !isDestroyed) {
+                    status.text = "Could not share diagnostics: ${e.javaClass.simpleName}. Try again."
+                }
+            } finally {
+                if (!isFinishing && !isDestroyed) button.isEnabled = true
+            }
+        }
     }
 
     companion object {

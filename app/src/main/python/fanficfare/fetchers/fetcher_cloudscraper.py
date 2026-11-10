@@ -43,14 +43,16 @@ class CloudScraperFetcher(RequestsFetcher):
                 'desktop': True,
                 })
 
-    def do_mounts(self,session):
-        super(CloudScraperFetcher,self).do_mounts(session)
+    def do_mounts(self,session,retries=None):
+        if retries is None:
+            retries = self.retries
+        super(CloudScraperFetcher,self).do_mounts(session,retries=retries)
         ## CipherSuiteAdapter adapter replaces HTTPAdapter
         session.mount('https://',cloudscraper.CipherSuiteAdapter(
                 cipherSuite=session.cipherSuite,
                 ssl_context=session.ssl_context,
                 source_address=session.source_address,
-                max_retries=self.retries))
+                max_retries=retries))
 
     def make_headers(self,url,referer=None,image=False):
         headers = super(CloudScraperFetcher,self).make_headers(url,

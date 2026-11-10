@@ -43,10 +43,11 @@ from ..htmlheuristics import replace_br_with_p
 
 logger = logging.getLogger(__name__)
 
+from .. import diagnostics
 from ..story import Story
 from ..requestable import Requestable
 from ..htmlcleanup import stripHTML, decode_email
-from ..exceptions import InvalidStoryURL, StoryDoesNotExist, HTTPErrorFFF
+from ..exceptions import InvalidStoryURL, StoryDoesNotExist, HTTPErrorFFF, ConflictingOptions
 
 # was defined here before, imported for all the adapters that still
 # expect it.
@@ -88,10 +89,11 @@ class BaseSiteAdapter(Requestable):
 
         self.storyDone = False
         self.metadataDone = False
-        self.story = Story(configuration)
-        self.story.setMetadata('site',self.getConfigSection())
-        self.story.setMetadata('dateCreated',datetime.now())
-        self.chapterUrls = [] # dicts of (chapter title,chapter url)
+
+        # story.chapters will contain the same info plus 'html', but
+        # only *after* the chapter text has been collected.
+        self.chapterInfos = [] # list of dicts of (chapter title,chapter url,etc)
+
         self.chapterFirst = None
         self.chapterLast = None
         self.oldchapters = None
@@ -104,12 +106,20 @@ class BaseSiteAdapter(Requestable):
         self.calibrebookmark = None
         self.logfile = None
         self.ignore_chapter_url_list = None
+        self.dedup_chapter_urls = set()
         self.parsed_QS = None
+
+        self.reset_story(url)
 
         self.section_url_names(self.getSiteDomain(),self.get_section_url)
 
         ## for doing some performance profiling.
         self.times = TimeKeeper()
+
+    def reset_story(self,url=None):
+        self.story = Story(self.get_configuration())
+        self.story.setMetadata('site',self.getConfigSection())
+        self.story.setMetadata('dateCreated',datetime.now())
 
         ## Save class inheritence list in metadata.  Must be added to
         ## extra_valid_entries to use.
@@ -120,6 +130,8 @@ class BaseSiteAdapter(Requestable):
         cl.remove('Requestable')
         self.story.extendList('adapter_classes',cl)
 
+        if not url:
+            url = self.url
         self._setURL(url)
         if not self.validateURL():
             raise InvalidStoryURL(url,
@@ -179,20 +191,27 @@ class BaseSiteAdapter(Requestable):
             self.chapterLast=int(last)-1
         self.story.set_chapters_range(first,last)
 
+    def get_ignore_chapter_url_list(self):
+        if self.ignore_chapter_url_list == None:
+            self.ignore_chapter_url_list = set()
+            for u in self.getConfig('ignore_chapter_url_list').splitlines():
+                self.ignore_chapter_url_list.add(self.normalize_chapterurl(u))
+        return self.ignore_chapter_url_list
+
     def add_chapter(self,title,url,othermeta={}):
         ## Check for chapter URL in ignore_chapter_url_list.
-        ## Normalize chapter urls, both from list and passed in, but
-        ## don't save them that way to match previous behavior.
-        if self.ignore_chapter_url_list == None:
-            self.ignore_chapter_url_list = {}
-            for u in self.getConfig('ignore_chapter_url_list').splitlines():
-                self.ignore_chapter_url_list[self.normalize_chapterurl(u)] = True
-
+        ## Normalize chapter urls, both from list and passed in
         normal_chap_url = self.normalize_chapterurl(url)
-        if normal_chap_url not in self.ignore_chapter_url_list:
+        if normal_chap_url not in self.get_ignore_chapter_url_list():
             if self.getConfig('dedup_chapter_list',False):
-                # leverage ignore list to implement dedup'ing
-                self.ignore_chapter_url_list[normal_chap_url] = True
+                ## Note that update_preserve_deleted_chapters also
+                ## dedups chapter urls in the exceedingly rare case of
+                ## duplicate chapter URLs that are later all removed.
+                if normal_chap_url in self.dedup_chapter_urls:
+                    logger.debug("dedup_chapter_list: Skipping dup chapter url %s"%url)
+                    return False
+                else:
+                    self.dedup_chapter_urls.add(normal_chap_url)
 
             meta = defaultdict(str,othermeta) # copy othermeta
             if title:
@@ -201,8 +220,10 @@ class BaseSiteAdapter(Requestable):
                 ## A default value for when there's no chapter
                 ## title. Cropped up once with adapter_novelonlinefullcom
                 title = "Chapter %s"%(self.num_chapters()+1)
-            meta.update({'title':title,'url':url}) # after other to make sure they are set
-            self.chapterUrls.append(meta)
+            meta.update({'title':title,      # 'title' gets changed by chapter_title_X_patterns
+                         'site_title':title, # 'site_title' unchanged from site.
+                         'url':url}) # after othermeta to make sure they are set
+            self.chapterInfos.append(meta)
             self.story.setMetadata('numChapters', self.num_chapters())
             return True
         # return true/false for those adapters that count words by
@@ -210,23 +231,265 @@ class BaseSiteAdapter(Requestable):
         return False
 
     def num_chapters(self):
-        return len(self.chapterUrls)
+        return len(self.chapterInfos)
 
     def get_chapter(self,i,attr):
-        return self.chapterUrls[i].get(attr,None)
+        return self.chapterInfos[i].get(attr,None)
 
     def get_chapters(self):
-        return copy.deepcopy(self.chapterUrls)
+        return copy.deepcopy(self.chapterInfos)
 
     def del_chapter(self,i):
-        del self.chapterUrls[i]
+        del self.chapterInfos[i]
         self.story.setMetadata('numChapters', self.num_chapters())
+
+    def _chapter_text(self, html_or_soup):
+        """Normalize chapter content for change detection.
+
+        Strips the epubutils-style title/skip blocks and HTML, then
+        collapses whitespace so stored and freshly downloaded chapters
+        can be compared on text alone.  Accepts either an html string
+        or a BeautifulSoup object."""
+        if not html_or_soup:
+            return ''
+        try:
+            from bs4 import BeautifulSoup as _BS
+            if isinstance(html_or_soup, str):
+                soup = _BS(html_or_soup, 'html.parser')
+            else:
+                soup = html_or_soup
+        except Exception:
+            soup = _BS(str(html_or_soup), 'html.parser')
+        # mirror epubutils.get_update_data stripping of the chapter
+        # title and skip_on_ffdl_update blocks
+        hx = soup.select_one('.fff_chapter_title')
+        if not hx:
+            hx = soup.select_one('body > h2, h3')
+        if hx:
+            hx.extract()
+        for skip in soup.find_all(attrs={'class': 'skip_on_ffdl_update'}):
+            skip.extract()
+        body = soup.find('body') or soup
+        text = stripHTML(body)
+        return re.sub(r'\s+', ' ', text).strip()
+
+    def _chapter_needs_recheck(self, url, index, total_site_chapters):
+        """Determine if a chapter should be re-downloaded for edit detection.
+
+        The edit-check window is the LAST recent_count chapters of the
+        OLD EPUB in reading order, NOT the last recent_count chapters of
+        the site.  With a site-based window the "most recent" site
+        chapters are usually brand-new ones that are not in the epub at
+        all, so no previously-downloaded chapter ever gets re-checked;
+        an epub-based window keeps re-checking the chapters the reader
+        most recently got (the ones authors most often edit) even after
+        the site has grown far past them.  index/total_site_chapters
+        are accepted for API compatibility but no longer used here.
+        """
+        recent_count = int(self.getConfig('update_check_recent_chapters', 0) or 0)
+
+        if recent_count > 0 and self.oldchaptersmap:
+            try:
+                if list(self.oldchaptersmap.keys()).index(url) >= \
+                        len(self.oldchaptersmap) - recent_count:
+                    return True
+            except ValueError:
+                pass
+
+        return False
+
+    def preserve_deleted_chapters(self):
+        """True when chapters missing from the site should be preserved
+        in the updated epub."""
+        retval = self.getConfig('update_preserve_deleted_chapters')
+        if retval and (self.chapterFirst is not None or \
+                           self.chapterLast is not None):
+            ## Chapter ranges are applied to the chapter list *from
+            ## the site*.  If it changes (which is the whole point of
+            ## update_preserve_deleted_chapters), things get confused
+            ## and chapters aren't preserved correctly.
+            ##
+            ## It will make more of a difference if/when
+            ## saving/reusing chapter is implemented.
+            ## https://github.com/JimmXinu/FanFicFare/issues/1413
+            raise ConflictingOptions("Cannot use chapter range with update_preserve_deleted_chapters:true")
+        return retval
+
+    def recheck_recent_chapters(self):
+        """True when edit detection wants previously-downloaded chapters
+        re-downloaded during an update (recent-window)."""
+        return bool(int(self.getConfig('update_check_recent_chapters') or 0))
+
+    def _recheck_chapter(self, url, index):
+        """Re-download a chapter for edit detection and keep the fresh
+        version only if its content differs from the stored one.
+
+        Returns the html bytes/string to use for the chapter.  Falls
+        back to the stored chapter on download/parse failure so an
+        edit-check problem never drops a chapter.
+        """
+        try:
+            fresh_data = self.getChapterTextNum(url, index)
+            if self._chapter_text(fresh_data) != self._chapter_text(self.oldchaptersmap[url]):
+                # Content changed, use fresh version
+                self.story.chapter_updated_count += 1
+                logger.info("Chapter %d (%s) content changed, using updated version" % (index+1, url))
+                return fresh_data
+            # Content unchanged, reuse old
+            return self.utf8FromSoup(None,
+                                     self.oldchaptersmap[url])
+        except Exception as e:
+            logger.warning("Edit check for %s failed, reusing old: %s" % (url, e))
+            return self.utf8FromSoup(None,
+                                     self.oldchaptersmap[url])
+
+    def _preserve_deleted_chapters(self):
+        """Carry forward chapters that were in the old epub but are no
+        longer on the site.
+
+        Preserved chapters are inserted at their original position
+        relative to the remaining site chapters so chronological order
+        is kept.  After assembly the final chapters are renumbered so
+        the 'number'/'index04'/'index' fields (used by chapter_title
+        patterns) are stable even though preserved chapters were
+        inserted mid-list.
+        """
+        if not (self.preserve_deleted_chapters() and self.oldchaptersmap):
+            return
+
+        site_urls = set(ch['url'] for ch in self.get_chapters())
+        old_urls_in_order = list(self.oldchaptersmap.keys())
+        preserve_list = []
+        for old_url in old_urls_in_order:
+            ## apply ignore_chapter_url_list otherwise any chapters user
+            ## adds to ignore_chapter_url_list will be preserved.
+            normal_chap_url = self.normalize_chapterurl(old_url)
+            if old_url not in site_urls and \
+                    normal_chap_url not in self.get_ignore_chapter_url_list():
+                preserve_list.append(old_url)
+
+        for old_url in preserve_list:
+            old_soup = self.oldchaptersmap[old_url]
+
+            # Preserve this chapter as a deleted chapter
+            # Restore the chapter's real title.  The old soup
+            # no longer carries it (epubutils.get_update_data
+            # strips the leading fff_chapter_title heading), so
+            # prefer the chapter/origtitle recorded in the
+            # epub's <meta> tags, then any h3 left in the old
+            # soup, then the URL slug as a last resort.
+            # Update: After 4.62.15 chapter metadata is saved in
+            # epub.
+            old_data = self.oldchaptersdata.get(old_url, {}) \
+                if self.oldchaptersdata else {}
+
+            # logger.debug("="*50)
+            # import pprint
+            # debug_data = dict(old_data)
+            # if 'html' in debug_data:
+            #     del debug_data['html']
+            # logger.debug("\n"+pprint.pformat(debug_data))
+
+            old_title = old_data.get('site_title') or \
+                old_data.get('origchapter') or \
+                old_data.get('title')
+            if not old_title:
+                old_h3 = old_soup.find('h3') if old_soup else None
+                if old_h3:
+                    old_title = old_h3.get_text(strip=True)
+            if not old_title:
+                old_title = old_url.split('/')[-1].replace('-', ' ').replace('_', ' ')
+            # copy old_data to include chapter dates, etc.
+            preserved_chap = dict(old_data)
+            preserved_chap.update({
+                    # old_data only carries 'url' for epubs written by
+                    # 4.62.13+ (fff_chapter_data meta tag).  Older epubs
+                    # must fall back to the oldchaptersmap key
+                    'url': old_url,
+                    # reset title for chapter_title_X_patterns
+                    'title': old_title,
+                    'html': self.utf8FromSoup(None, old_soup) if old_soup else '',
+                    'preserved_chapter_mark': self.getConfig('preserved_chapter_mark','(Preserved Deleted Chapter)'),
+            })
+            # Android compatibility: sparse legacy EPUBs have neither
+            # site_title nor origchapter. Reuse the safe fallback above.
+            if not preserved_chap.get('site_title'):
+                preserved_chap['site_title'] = old_title
+            # mark_new_chapters can also be latestonly. Preserved are,
+            # by definition, not latest new.
+            mark_new = False
+            if self.getConfig('mark_new_chapters') == 'true':
+                if 'mark_new' in old_data:
+                    mark_new = old_data['mark_new']
+                elif 'origchapter' in old_data and 'title' in old_data:
+                    # only use title mis-match if no mark_new flag.
+                    # both keys must be there: a legacy epub carries
+                    # origchapter but no 'title', and comparing a
+                    # missing value against a present one would mark
+                    # the preserved chapter new.
+                    mark_new = old_data['origchapter'] != old_data['title']
+
+            # Use addChapter() so the chapter dict gets all the
+            # fields getChapters() expects ('mark_new', 'number',
+            # 'index04', 'index', 'origchapter', 'tocchapter').
+            # addChapter() appends; then move the chapter into
+            # its chronological slot, before the first surviving
+            # site chapter that originally followed it.
+            self.story.addChapter(dict(preserved_chap),mark_new=mark_new)
+
+            preserved = self.story.chapters.pop()
+            ch_index = len(self.story.chapters)
+            last_survivor_index = -1
+            for i, existing in enumerate(self.story.chapters):
+                if existing['url'] in old_urls_in_order:
+                    last_survivor_index = i
+                    if old_urls_in_order.index(existing['url']) > old_urls_in_order.index(old_url):
+                        ch_index = i
+                        break
+            else:
+                # No surviving site chapter originally followed
+                # this one (everything after it on the site was
+                # deleted).  Insert just after the last surviving
+                # old chapter so it lands BEFORE brand-new
+                # chapters instead of after them.
+                if last_survivor_index >= 0:
+                    ch_index = last_survivor_index + 1
+            ## self.story and self.chapterInfos are very similar, but
+            ## not identical.  adapter list is used for numChapters,
+            ## story list has 'html'.
+            self.story.chapters.insert(ch_index, preserved)
+            info_preserved = dict(preserved)
+            del info_preserved['html']
+            self.chapterInfos.insert(ch_index, info_preserved)
+            self.story.setMetadata('numChapters', self.num_chapters())
+            logger.info("Preserved deleted chapter: %s" % old_url)
+
+        # Renumber chapters to match the final chronological order.
+        # No-op when all chapters were appended in order.
+        for i, ch in enumerate(self.story.chapters):
+            ch['number'] = i + 1
+            num = '%04d' % (i + 1)
+            ch['index04'] = num
+            ch['index'] = num
+
+    def _report_update_counters(self):
+        """Log the final book's chapter composition: chapters carried
+        from the old epub and chapters genuinely added.  Counted after
+        assembly so the totals reflect the epub that will actually be
+        written."""
+        old_urls = set((self.oldchaptersmap or {}).keys())
+        final_urls = {ch['url'] for ch in self.story.chapters}
+        new_urls = final_urls - old_urls
+        self.story.chapter_added_count = len(new_urls)
+        self.story.chapter_written_count = len(self.story.chapters)
+        logger.info("UPDATE_COUNTERS updated="+str(self.story.chapter_updated_count)+" added="+str(self.story.chapter_added_count)+" written="+str(self.story.chapter_written_count)+" old_urls="+str(len(old_urls))+" new_urls="+str(len(new_urls)))
 
     def img_url_trans(self,imgurl):
         "Hook for transforming img urls in adapter"
         return imgurl
 
     # Does the download the first time it's called.
+    @diagnostics.phase('chapter')
     def getStory(self, notification=lambda x,y:x):
         if not self.storyDone:
             self.getStoryMetadataOnly(get_cover=True)
@@ -248,16 +511,18 @@ class BaseSiteAdapter(Requestable):
                         continue_on_chapter_error_try_limit))
 
             def do_error_chapter(txt,title):
-                data = self.make_soup(txt)
+                data = txt
                 title = title+self.getConfig("chapter_title_error_mark","(CHAPTER ERROR)")
                 url="chapter url removed due to failure"
                 return data, title, url
 
-            for index, chap in enumerate(self.chapterUrls):
+            for index, chap in enumerate(self.chapterInfos):
+                diagnostics.start_chapter(index, len(self.chapterInfos), chap['url'])
+                diagnostic_errors_before = self.story.chapter_error_count
                 title = chap['title']
                 url = chap['url']
                 #logger.debug("index:%s"%index)
-                newchap = False
+                mark_new = False
                 passchap = dict(chap)
                 if (self.chapterFirst!=None and index < self.chapterFirst) or \
                         (self.chapterLast!=None and index > self.chapterLast):
@@ -266,10 +531,16 @@ class BaseSiteAdapter(Requestable):
                     data = None
                     if self.oldchaptersmap:
                         if url in self.oldchaptersmap:
-                            # logger.debug("index:%s title:%s url:%s"%(index,title,url))
-                            # logger.debug(self.oldchaptersmap[url])
-                            data = self.utf8FromSoup(None,
-                                                     self.oldchaptersmap[url])
+                            # Check if edit detection wants us to
+                            # re-check this chapter.
+                            if self._chapter_needs_recheck(
+                                    url, index, len(self.chapterInfos)):
+                                data = self._recheck_chapter(url, index)
+                            else:
+                                # logger.debug("index:%s title:%s url:%s"%(index,title,url))
+                                # logger.debug(self.oldchaptersmap[url])
+                                data = self.utf8FromSoup(None,
+                                                         self.oldchaptersmap[url])
                     elif self.oldchapters and index < len(self.oldchapters):
                         data = self.utf8FromSoup(None,
                                                  self.oldchapters[index])
@@ -277,11 +548,15 @@ class BaseSiteAdapter(Requestable):
                     if self.getConfig('mark_new_chapters') == 'true':
                         # if already marked new -- ie, origtitle and title don't match
                         # logger.debug("self.oldchaptersdata[url]:%s"%(self.oldchaptersdata[url]))
-                        newchap = (self.oldchaptersdata is not None and
-                                   url in self.oldchaptersdata and (
-                                self.oldchaptersdata[url]['chapterorigtitle'] !=
-                                self.oldchaptersdata[url]['chaptertitle']) )
-
+                        old_data = self.oldchaptersdata.get(url) or {} \
+                            if self.oldchaptersdata else {}
+                        # only compare when both keys are there: a legacy
+                        # epub may have neither, and comparing a missing
+                        # value against a present one would mark every
+                        # chapter new.
+                        mark_new = (old_data.get('mark_new') or (
+                            'origchapter' in old_data and 'title' in old_data and
+                            old_data['origchapter'] != old_data['title']))
                     try:
                         if not data:
                             if( self.getConfig('continue_on_chapter_error') and
@@ -299,16 +574,17 @@ try to download.</p>
 </div>"""%(continue_on_chapter_error_try_limit,url,url),title)
                             else:
                                 data = self.getChapterTextNum(url,index)
-                                # if had to fetch and has existing chapters
-                                newchap = bool(self.oldchapters or self.oldchaptersmap)
+                                # if had to fetch and has other existing chapters
+                                mark_new = bool(self.oldchapters or self.oldchaptersmap)
 
                         if index == 0 and self.getConfig('always_reload_first_chapter'):
                             data = self.getChapterTextNum(url,index)
-                            # first chapter is rarely marked new
-                            # anyway--only if it's replaced during an
-                            # update.
-                            newchap = False
+                            # preserve mark_new from edit detection if active
+                            if not self.recheck_recent_chapters():
+                                mark_new = False
                     except Exception as e:
+                        diagnostics.emit('chapter_exception', error_type=type(e).__name__,
+                                         http_status=getattr(e, 'status_code', None))
                         if self.getConfig('continue_on_chapter_error',False):
                             logger.info("continue_on_chapter_error: (%s) %s"%(url,e))
                             logger.debug(traceback.format_exc())
@@ -328,10 +604,15 @@ try to download.</p>
                     passchap['url'] = url
                     passchap['title'] = title
                     passchap['html'] = data
-                    ## XXX -- add chapter text replacement here?
-                    ## No?  Want to be able to configure by [writer]
-                    ## It's a soup or soup part?
-                self.story.addChapter(passchap, newchap)
+                self.story.addChapter(passchap, mark_new)
+                diagnostics.finish_chapter('placeholder' if self.story.chapter_error_count > diagnostic_errors_before else 'success')
+
+            # Carry forward chapters that are no longer on the site
+            # (preservation) and renumber, then report the chapter
+            # composition of the final book.
+            self._preserve_deleted_chapters()
+            self._report_update_counters()
+
             self.storyDone = True
 
             # copy oldcover tuple to story.
@@ -374,6 +655,15 @@ try to download.</p>
         # logger.debug(u"getStory times:\n%s"%self.times)
         return self.story
 
+    def getStorySeriesMetadataOnly(self,metadata):
+        if self.getConfig('use_series_page_metadata'):
+            logger.debug("use_series_page_metadata: Using series page metadata")
+            if not self.metadataDone:
+                self.story.metadata = metadata
+                return self.story
+        return None
+
+    @diagnostics.phase('metadata')
     def getStoryMetadataOnly(self,get_cover=True):
         if not self.metadataDone:
             try:
@@ -407,8 +697,8 @@ try to download.</p>
 
             self.metadataDone = True
             # normalize chapter urls.
-            for index, chap in enumerate(self.chapterUrls):
-                self.chapterUrls[index]['url'] = self.normalize_chapterurl(chap['url'])
+            for index, chap in enumerate(self.chapterInfos):
+                self.chapterInfos[index]['url'] = self.normalize_chapterurl(chap['url'])
 
         ## load existing epub images in story ImageStore so they
         ## are re-used, but not processed again.  Prior system was
@@ -502,8 +792,9 @@ try to download.</p>
         ## flaky chapter aborts the entire download.
         try:
             return self.getChapterText(url)
-        except (ChunkedEncodingError, ProtocolError, IncompleteRead):
+        except (ChunkedEncodingError, ProtocolError, IncompleteRead) as e:
             logger.warning("Transient network error fetching %s, retrying once"%url)
+            diagnostics.chapter_retry(e)
             return self.getChapterText(url)
         except HTTPErrorFFF as e:
             ## Android patch: a rate-limited site answering 429/5xx mid-story
@@ -513,7 +804,10 @@ try to download.</p>
             ## same patch in fetcher_requests.make_retries.)
             if e.status_code in (429, 500, 502, 503, 504):
                 logger.warning("Server busy (%s) fetching %s, retrying once"%(e.status_code,url))
-                time.sleep(5)
+                diagnostics.chapter_retry(e)
+                diagnostics.timed_sleep(5, 'chapter_retry', sleep_fn=time.sleep,
+                                        chapter_attempt=2, http_status=e.status_code,
+                                        **diagnostics.safe_url(url))
                 return self.getChapterText(url)
             raise
 
@@ -525,8 +819,7 @@ try to download.</p>
         ## work best.  Separate function to keep adapter code minimal.
         pass
 
-    def get_urls_from_page(self,url,normalize):
-        from ..geturls import get_urls_from_html
+    def get_urls_from_page(self,url,normalize=False,geturls=None):
         '''
         This is a method in adapter now rather than the generic code
         that was in geturls.py to allow individual adapters to
@@ -540,7 +833,7 @@ try to download.</p>
 
         # this way it uses User-Agent or other special settings.
         data = self.get_request(url,usecache=False)
-        series = self.get_series_from_page(url,data,normalize)
+        series = self.get_series_from_page(url,data,normalize,geturls)
         if series:
             # just to make it easier for adapters.
             if isinstance(series.get('desc',None),(BeautifulSoup,Tag)):
@@ -549,13 +842,11 @@ try to download.</p>
             # Should they be removed?
             return series
         else:
-            return {'urllist':get_urls_from_html(self.make_soup(data),
-                                                 url,
-                                                 configuration=self.configuration,
-                                                 normalize=normalize)}
+            return {'urllist':geturls.get_urls_from_html(self.make_soup(data),
+                                                         url,
+                                                         normalize=normalize)}
 
-    def get_series_from_page(self,url,data,normalize=False):
-        from ..geturls import get_urls_from_html
+    def get_series_from_page(self,url,data,normalize=False,geturls=None):
         '''
         This method is to make it easier for adapters to detect a
         series URL, pick out the series metadata and list of storyUrls
@@ -617,10 +908,9 @@ try to download.</p>
                 # eFictions is a nightmare that the pre-existing
                 # get_urls_from_html() handles well enough.
                 # logger.debug(soup)
-                retval['urllist']=get_urls_from_html(soup,
-                                                     url,
-                                                     configuration=self.configuration,
-                                                     normalize=normalize)
+                retval['urllist']=geturls.get_urls_from_html(soup,
+                                                             url,
+                                                             normalize=normalize)
         except Exception as e:
             logger.debug("get_series_from_page for eFiction failed:%s"%e)
             retval = {}
@@ -822,7 +1112,7 @@ try to download.</p>
             for embedded in soup.select('style'):
                 embedded.string = self.include_css_urls(url,embedded.string)
         elif self.getConfig('keep_img_tags'):
-            logger.debug("keep_img_tags")
+            # logger.debug("keep_img_tags")
             ## keep <img>s normalize src attrs.
             acceptable_attributes.extend(('src','alt'))
             for img in soup.find_all('img'):

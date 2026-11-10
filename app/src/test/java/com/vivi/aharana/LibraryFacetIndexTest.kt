@@ -28,6 +28,10 @@ object LibraryFacetIndexTest {
         for (book in books) restarted.read(book)
         check(parses == 0 && writes == 0)
         val changed = Book("book-2", "2")
+        val snapshotBeforeRowRead = disk[changed.path]
+        restarted.read(changed, cacheResult = false)
+        check(disk[changed.path] == snapshotBeforeRowRead) { "a visible-row read replaced the saved manual filter snapshot" }
+        parses = 0; writes = 0
         restarted.read(changed)
         check(parses == 1 && writes == 1)
         sourceVersion = "2"; restarted.read(books[0])

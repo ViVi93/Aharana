@@ -52,6 +52,10 @@
         android:title="Filter library"
         app:showAsAction="never" />
     <item
+        android:id="@+id/action_refresh_filter_data"
+        android:title="Refresh filter data"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/action_search"
         android:title="Search"
         app:showAsAction="never"

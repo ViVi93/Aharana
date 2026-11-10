@@ -14,6 +14,9 @@ class PythonBridge(private val context: Context) {
         try {
             val python = Python.getInstance()
             module = python.getModule("fanficfare_bridge")
+            // WorkManager can start this process without MainActivity ever running.
+            // Restore imported configuration and activate diagnostics for every entry path.
+            initialize(SettingsActivity.getConfigDir(context).absolutePath)
         } catch (e: Exception) {
             initError = e.message ?: "unknown"
         }
@@ -63,14 +66,17 @@ class PythonBridge(private val context: Context) {
     fun updateEpubFromPath(epubPath: String, outDir: String): String =
         safeCall("update_epub_from_path", epubPath, outDir)
 
-    fun forceDownloadFromEpub(epubPath: String, outDir: String): String =
-        safeCall("force_download_from_epub", epubPath, outDir)
+    fun forceDownloadFromEpub(epubPath: String, outDir: String, fallbackUrl: String? = null): String =
+        safeCall("force_download_from_epub", epubPath, outDir, fallbackUrl)
 
     fun getCoverFromEpub(epubPath: String): String =
         safeCall("get_cover_from_epub", epubPath)
 
     fun readDownloadDebug(): String =
         safeCall("read_download_debug")
+
+    fun setDownloadDiagnosticContext(contextJson: String): String =
+        safeCall("set_download_diagnostic_context", contextJson)
 
     fun runDnsDiagnostics(): String =
         safeCall("run_dns_diagnostics")

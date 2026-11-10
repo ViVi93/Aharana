@@ -244,7 +244,7 @@ class BulkUrlTests(unittest.TestCase):
         targets = (
             "fanficfare.adapters.base_adapter.BaseSiteAdapter.getStoryMetadataOnly",
             "fanficfare.adapters.base_adapter.BaseSiteAdapter.getStory",
-            "fanficfare.geturls.get_urls_from_page",
+            "fanficfare.geturls.GetURLs.get_urls_from_page",
             "fanficfare.configurable.Configuration.get_fetcher",
             "fanficfare.configurable.Configuration.read",
             "fanficfare_config.build_configuration",

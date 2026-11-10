@@ -43,16 +43,25 @@ def _site(epub_path):
         return ''
 
 
-def get_library_facets(epub_path):
+def get_library_facets(epub_path, on_error=None):
     """Return {ok, authors, status, languages, series, tags, site} as a dict.
 
     Lists retain whole saved values in first-seen order. A readable source-less
     book is valid; unknown facets are empty. Errors never expose paths or XML.
     """
+    def report(stage, exc):
+        if on_error is not None:
+            try:
+                on_error(stage, exc)
+            except Exception:
+                pass
+
     try:
-        fields = epub_editor.read_metadata_fields(epub_path)
-        details = story_metadata.read_story_details(epub_path)
-        if not fields.get('ok') or not details.get('ok'):
+        fields = epub_editor.read_metadata_fields(epub_path, _on_error=lambda exc: report('metadata_fields', exc))
+        if not fields.get('ok'):
+            return dict(_ERROR)
+        details = story_metadata.read_story_details(epub_path, _on_error=lambda exc: report('story_details', exc))
+        if not details.get('ok'):
             return dict(_ERROR)
         metadata = fields['metadata']
         return {'ok': True,
@@ -62,5 +71,6 @@ def get_library_facets(epub_path):
                 'series': _values([metadata.get('series', '')]),
                 'tags': _values(metadata.get('tags', [])),
                 'site': _site(epub_path)}
-    except Exception:
+    except Exception as exc:
+        report('facets', exc)
         return dict(_ERROR)

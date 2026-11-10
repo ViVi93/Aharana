@@ -119,16 +119,18 @@ fun main() {
 
     def test_recovered_success_cannot_register_or_retarget_a_replacement(self):
         source = (SRC / 'FanFicFareWorker.kt').read_text().split('private suspend fun recoverExistingSuccess(', 1)[1].split('private suspend fun <T> withEngineHeartbeat', 1)[0]
-        self.assertTrue('if (existingJob.bookId > 0)' in source,
-                        'Success recovery must validate positive identity before its upsert branches')
-        guard = source.split('if (existingJob.bookId > 0)', 1)[1].split('val file = File(outputPath)', 1)[0]
+        self.assertTrue('if (existingJob.bookId > 0 &&' in source,
+                        'Success recovery must validate positive identity and canonical path')
+        self.assertNotIn('upsertBook(', source, 'Success replay must never mutate the library')
+        self.assertNotIn('jobDao.update', source, 'Success replay must retain its saved warnings')
+        guard = source.split('if (existingJob.bookId > 0 &&', 1)[1].split('\n', 1)[0]
         run_kotlin('''
 data class Row(val id: Long, val filePath: String)
 data class Job(val bookId: Long)
 class Dao(val rows: List<Row>) { fun findById(id: Long) = rows.find { it.id == id } }
 object Result { fun failure() = false }
-fun recovered(existingJob: Job, bookDao: Dao, outputPath: String): Boolean {
-    if (existingJob.bookId > 0) ''' + guard + '''
+fun recovered(existingJob: Job, bookDao: Dao, path: String): Boolean {
+    if (existingJob.bookId > 0 &&''' + guard + '''
     return true
 }
 fun main() {

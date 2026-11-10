@@ -21,6 +21,8 @@ import time
 from functools import partial
 
 from .log import make_log
+from ..exceptions import QuitDownloadException
+from .. import diagnostics
 
 import logging
 logger = logging.getLogger(__name__)
@@ -103,13 +105,14 @@ class SleepDecorator(FetcherDecorator):
                            usecache=True,
                            image=False):
         # logger.debug("SleepDecorator fetcher_do_request")
-        fetchresp = chainfn(
-            method,
-            url,
-            parameters=parameters,
-            referer=referer,
-            usecache=usecache,
-            image=image)
+        with diagnostics.capture_request() as request_fields:
+            fetchresp = chainfn(
+                method,
+                url,
+                parameters=parameters,
+                referer=referer,
+                usecache=usecache,
+                image=image)
 
         # don't sleep cached results.  Usually MemCache results will
         # be before sleep, but check fetchresp.fromcache for file://
@@ -126,6 +129,44 @@ class SleepDecorator(FetcherDecorator):
             if t:
                 rt = random.uniform(t*0.5, t*1.5)
                 logger.debug("random sleep(%0.2f-%0.2f):%0.2f"%(t*0.5, t*1.5,rt))
-                time.sleep(rt)
+                fields = dict(diagnostics.safe_url(url), kind='image' if image else 'page')
+                fields.update(request_fields)
+                diagnostics.timed_sleep(rt, 'politeness', sleep_fn=time.sleep, **fields)
+
+        return fetchresp
+
+## used with plugin to quit downloads early
+class QuitDecorator(FetcherDecorator):
+    def __init__(self):
+        super(QuitDecorator,self).__init__()
+        self.quit_fn = None
+
+    def decorate_fetcher(self,fetcher):
+        super(QuitDecorator,self).decorate_fetcher(fetcher)
+
+    def set_quit(self,fn):
+        self.quit_fn = fn
+
+    def fetcher_do_request(self,
+                           fetcher,
+                           chainfn,
+                           method,
+                           url,
+                           parameters=None,
+                           referer=None,
+                           usecache=True,
+                           image=False):
+        # logger.debug("QuitDecorator fetcher_do_request")
+        if self.quit_fn and self.quit_fn():
+            logger.debug("Quiting from quit_fn check.")
+            raise QuitDownloadException()
+
+        fetchresp = chainfn(
+            method,
+            url,
+            parameters=parameters,
+            referer=referer,
+            usecache=usecache,
+            image=image)
 
         return fetchresp

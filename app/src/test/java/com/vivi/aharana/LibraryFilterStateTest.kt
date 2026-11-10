@@ -7,6 +7,228 @@ object LibraryFilterStateTest {
     private var passed = 0
     private suspend fun test(name: String, block: suspend () -> Unit) { block(); passed++; println("PASS $name") }
     @JvmStatic fun main(args: Array<String>) = runBlocking {
+        test("cancel after A before B preserves the durable snapshot on a new coordinator and index") {
+            val books = listOf("a", "b")
+            fun record(path: String, value: String) = LibraryFacetRecord(path, mapOf("tags" to setOf(value)))
+            val original = books.associateWith { LibraryFacetIndex.Entry("1", "1", record(it, "Old")) }
+            val disk = original.toMutableMap()
+            val enteredB = CompletableDeferred<Unit>(); val cancelledB = CompletableDeferred<Unit>()
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            fun index() = LibraryFacetIndex<String>(identity = { it }, bookSignature = { "1" },
+                fileSignature = { "1" }, loadAll = { disk.toMap() }, save = { disk[it.record.path] = it },
+                delete = { disk.remove(it); Unit }, extract = { path ->
+                    if (path == "b") try { enteredB.complete(Unit); awaitCancellation() }
+                        finally { cancelledB.complete(Unit) }
+                    record(path, "New") to true
+                }, replaceSnapshot = { rows -> disk.clear(); disk.putAll(rows.associateBy { it.record.path }) })
+            fun state(cache: LibraryFacetIndex<String>) = LibraryFilterState(scope, { books }, { it },
+                read = { path: String -> cache.read(path, cacheResult = false) },
+                readFresh = { path: String -> cache.read(path, force = true, cacheResult = false) },
+                beginRefresh = cache::beginRefresh,
+                loadCached = { cache.cached(it, allowStale = true) }, manualRefreshOnly = true)
+            try {
+                val current = state(index()); current.restore(mapOf("tags" to setOf("Old")))
+                val refresh = launch { current.prepare(force = true) }; enteredB.await()
+                refresh.cancelAndJoin(); cancelledB.await()
+                check(current.records == original.mapValues { it.value.record })
+                check(disk == original) { "cancelled refresh durably advanced A before B completed: $disk" }
+                val restarted = state(index()); restarted.restore(current.selection)
+                check(restarted.records == current.records && restarted.selection == current.selection)
+            } finally { scope.cancel() }
+        }
+        test("manual startup, ordinary prepare, download and Apply perform zero source reads") {
+            var books = listOf("old")
+            var reads = 0; var freshReads = 0
+            var disk = emptyMap<String, Set<String>>()
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { books }, { it.sorted() }, { b: String ->
+                reads++; LibraryFacetRecord(b, emptyMap()) to true
+            }, readFresh = { b: String -> freshReads++; LibraryFacetRecord(b, emptyMap()) to true },
+                persistSelection = { disk = it }, manualRefreshOnly = true)
+            try {
+                state.restore(emptyMap())
+                state.validateInBackground().join()
+                state.prepare()
+                books = listOf("old", "downloaded"); state.booksChanged(); yield()
+                state.prepare()
+                state.apply(mapOf("status" to setOf("Complete"))).join()
+                check(reads == 0 && freshReads == 0) {
+                    "manual-only paths performed source IO: reads=$reads fresh=$freshReads"
+                }
+                check(state.records.isEmpty() && !state.isFresh())
+                check(state.pendingCount() == 2 && state.unknownCount() == 2 && state.needsRefresh())
+                check(state.selection == disk && disk["status"] == setOf("Complete"))
+            } finally { scope.cancel() }
+        }
+        test("manual emissions prune deleted choices but keep cached facets for edited books") {
+            data class Book(val path: String, val revision: Int)
+            var books = listOf(Book("keep", 1), Book("deleted", 1))
+            val old = LibraryFacetRecord("keep", mapOf("tags" to setOf("Cached")))
+            val removed = LibraryFacetRecord("deleted", mapOf("tags" to setOf("Deleted only")))
+            var reads = 0
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { books }, { rows -> rows.map { "${it.path}:${it.revision}" }.sorted() },
+                { b: Book -> reads++; LibraryFacetRecord(b.path, emptyMap()) to true },
+                loadCached = { mapOf("keep" to old, "deleted" to removed) }, identity = { it.path },
+                manualRefreshOnly = true)
+            try {
+                state.restore(mapOf("tags" to setOf("Cached")))
+                books = listOf(Book("keep", 2), Book("new", 1)); state.booksChanged()
+                state.prepare(); state.apply(mapOf("tags" to setOf("Cached"))).join()
+                check(state.records == mapOf("keep" to old)) { "deleted facets survived membership change" }
+                check(state.indexedBooks == listOf(Book("keep", 2)))
+                check(LibraryFilters.options(state.records.values, "tags") == mapOf("Cached" to 1))
+                check(!state.isFresh() && reads == 0)
+                check(state.pendingCount() == 2 && state.unknownCount() == 1)
+                check(state.selection["tags"] == setOf("Cached"))
+                books = emptyList(); state.booksChanged()
+                check(state.records.isEmpty() && state.pendingCount() == 0 && state.isFresh() && reads == 0)
+            } finally { scope.cancel() }
+        }
+        test("manual forced refresh rereads fresh data and is cancellable with active filters") {
+            val entered = CompletableDeferred<Unit>(); val cancelled = CompletableDeferred<Unit>()
+            var block = true; var reads = 0; var freshReads = 0; var progress = ""
+            val old = LibraryFacetRecord("a", mapOf("status" to setOf("Complete")))
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { listOf("a") }, { it }, { b: String ->
+                reads++; LibraryFacetRecord(b, emptyMap()) to true
+            }, readFresh = { b: String ->
+                freshReads++
+                if (block) try { entered.complete(Unit); awaitCancellation() }
+                    finally { cancelled.complete(Unit) }
+                LibraryFacetRecord(b, mapOf("status" to setOf("Hiatus"))) to true
+            }, loadCached = { mapOf("a" to old) }, onProgress = { progress = it }, manualRefreshOnly = true)
+            try {
+                state.restore(mapOf("status" to setOf("Complete")))
+                val preview = launch { state.prepare(force = true) }; entered.await()
+                check(progress.startsWith("Refreshing filter data"))
+                preview.cancelAndJoin(); yield()
+                check(cancelled.isCompleted && progress.isEmpty()) { "active selection pinned a cancelled manual refresh" }
+                check(state.records["a"] == old && state.selection["status"] == setOf("Complete"))
+                block = false; state.prepare(force = true)
+                check(reads == 0 && freshReads == 2 && state.isFresh())
+                check(state.records["a"]?.facets?.get("status") == setOf("Hiatus"))
+            } finally { scope.cancel() }
+        }
+        test("manual restart retains revision-stale durable facets without source checks") {
+            data class Book(val path: String, val revision: Int)
+            val old = LibraryFacetRecord("edited", mapOf("status" to setOf("Complete")))
+            val disk = linkedMapOf("edited" to LibraryFacetIndex.Entry("1", "1", old),
+                "deleted" to LibraryFacetIndex.Entry("1", "1", LibraryFacetRecord("deleted", emptyMap())))
+            var checks = 0; var parses = 0; var loads = 0
+            val index = LibraryFacetIndex<Book>(identity = { it.path }, bookSignature = { it.revision.toString() },
+                fileSignature = { checks++; "1" }, loadAll = { loads++; disk.toMap() },
+                save = { disk[it.record.path] = it }, delete = { disk.remove(it); Unit }, extract = { b ->
+                    parses++; LibraryFacetRecord(b.path, mapOf("status" to setOf("Hiatus"))) to true
+                })
+            val books = listOf(Book("edited", 2))
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { books }, { rows -> rows.map { "${it.path}:${it.revision}" } },
+                read = { b: Book -> index.read(b) }, readFresh = { b: Book -> index.read(b, force = true) },
+                loadCached = { index.cached(it, allowStale = true) }, identity = { it.path }, manualRefreshOnly = true,
+                cachedCurrentPaths = { index.cached(it).keys })
+            try {
+                state.restore(mapOf("status" to setOf("Complete")))
+                check(state.records["edited"] == old) { "restart discarded revision-stale cached facets" }
+                check(!state.isFresh()) { "restoring changed revisions falsely declared cached data current" }
+                state.validateInBackground().join(); state.prepare()
+                state.apply(mapOf("status" to setOf("Complete"))).join()
+                check(checks == 0 && parses == 0 && loads == 1)
+                index.prune(books.mapTo(hashSetOf()) { it.path })
+                check(disk.keys == setOf("edited") && state.indexedBooks == books)
+                state.prepare(force = true)
+                check(checks == 2 && parses == 1 && state.isFresh())
+                check(state.records["edited"]?.facets?.get("status") == setOf("Hiatus"))
+            } finally { scope.cancel() }
+        }
+        test("manual refresh handles concurrent add/delete/edit atomically without Apply reads") {
+            var books = listOf("old", "deleted")
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val old = LibraryFacetRecord("old", mapOf("tags" to setOf("Cached")))
+            var reads = 0; var freshReads = 0
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { books }, { it.sorted() }, { _: String ->
+                reads++; error("ordinary metadata reader must never run in manual mode")
+            }, readFresh = { b: String ->
+                if (++freshReads == 1) { entered.complete(Unit); release.await() }
+                LibraryFacetRecord(b, mapOf("tags" to setOf("Fresh"))) to true
+            }, loadCached = { mapOf("old" to old, "deleted" to LibraryFacetRecord("deleted", emptyMap())) },
+                manualRefreshOnly = true)
+            try {
+                state.restore(mapOf("tags" to setOf("Cached")))
+                val refresh = launch { state.prepare(force = true) }; entered.await()
+                books = listOf("old", "edited", "downloaded"); state.booksChanged()
+                state.prepare(); state.apply(mapOf("tags" to setOf("Fresh"))).join()
+                check(state.records == mapOf("old" to old) && !refresh.isCompleted && reads == 0)
+                release.complete(Unit); refresh.join()
+                check(state.records.keys == books.toSet() && state.indexedBooks == books && state.isFresh())
+                check(state.records.values.all { it.facets["tags"] == setOf("Fresh") })
+                check(state.selection["tags"] == setOf("Fresh") && reads == 0)
+            } finally { scope.cancel() }
+        }
+        test("manual failed refresh and failed persistence retain the last committed snapshot") {
+            val old = LibraryFacetRecord("a", mapOf("status" to setOf("Complete")))
+            var disk = mapOf("status" to setOf("Complete"))
+            var saveFails = false; var message = ""; var sourceReads = 0
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            val state = LibraryFilterState(scope, { listOf("a") }, { it }, { _: String ->
+                error("ordinary source path")
+            }, readFresh = { _: String -> sourceReads++; error("private source failure") },
+                loadCached = { mapOf("a" to old) }, onError = { message = it },
+                persistSelection = { if (saveFails) error("private disk error") else disk = it },
+                manualRefreshOnly = true)
+            try {
+                state.restore(disk)
+                var failed = false
+                try { state.prepare(force = true) } catch (_: IllegalStateException) { failed = true }
+                check(failed && state.records["a"] == old && state.selection == disk && state.needsRefresh())
+                state.prepare(); check(sourceReads == 1)
+                saveFails = true; state.apply(mapOf("status" to setOf("Hiatus"))).join()
+                check(state.selection == disk && state.records["a"] == old && message.isNotBlank())
+                check(!message.contains("private") && sourceReads == 1)
+                saveFails = false; state.apply(emptyMap()).join()
+                check(disk.isEmpty() && state.selection.isEmpty() && sourceReads == 1)
+            } finally { scope.cancel() }
+        }
+        test("cancel during an accepted manual selection save publishes disk success before cancellation returns") {
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            var disk = mapOf("tags" to setOf("Old"))
+            val state = LibraryFilterState(scope, { listOf("a") }, { it },
+                { b: String -> LibraryFacetRecord(b, emptyMap()) to true },
+                persistSelection = { entered.complete(Unit); release.await(); disk = it }, manualRefreshOnly = true)
+            try {
+                state.restore(disk)
+                val saving = state.apply(mapOf("tags" to setOf("New"))); entered.await()
+                saving.cancel(); release.complete(Unit); saving.join()
+                check(state.selection == disk && disk["tags"] == setOf("New")) {
+                    "accepted save changed disk but cancellation skipped the matching memory publication"
+                }
+            } finally { scope.cancel() }
+        }
+        test("manual selection persistence is ordered and restart never reads an EPUB") {
+            var disk = emptyMap<String, Set<String>>()
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            var saves = 0; var reads = 0
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            fun fresh() = LibraryFilterState(scope, { listOf("a") }, { it }, { b: String ->
+                reads++; LibraryFacetRecord(b, emptyMap()) to true
+            }, persistSelection = {
+                if (++saves == 1) { entered.complete(Unit); release.await() }
+                disk = it
+            }, manualRefreshOnly = true)
+            try {
+                val state = fresh(); state.restore(emptyMap())
+                val first = state.apply(mapOf("authors" to setOf("Alice"))); entered.await()
+                val latest = state.apply(mapOf("authors" to setOf("Doe, Jane")))
+                release.complete(Unit); first.join(); latest.join()
+                check(disk == state.selection && disk["authors"] == setOf("Doe, Jane"))
+                val restarted = fresh(); restarted.restore(disk); restarted.prepare()
+                check(restarted.selection == disk && saves == 2 && reads == 0)
+                restarted.apply(emptyMap()).join()
+                check(disk.isEmpty() && restarted.selection.isEmpty() && reads == 0)
+            } finally { scope.cancel() }
+        }
         test("Apply rechecks freshness after a download while the dialog was open") {
             var books = listOf("old")
             val scope = CoroutineScope(coroutineContext + SupervisorJob())
@@ -247,7 +469,7 @@ object LibraryFilterStateTest {
             val scope = CoroutineScope(coroutineContext + SupervisorJob())
             val state = LibraryFilterState(scope, { books }, { it.sorted() }, { _: String ->
                 reads++; error("source IO must not gate cached startup")
-            }, loadCached = { bulkLoads++; cached })
+            }, loadCached = { bulkLoads++; cached }, manualRefreshOnly = true)
             try {
                 state.restore(mapOf("status" to setOf("Complete")))
                 check(reads == 0 && bulkLoads == 1)

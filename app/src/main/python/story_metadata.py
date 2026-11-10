@@ -49,7 +49,7 @@ def _explicit_status(value):
     return value if len(value) <= 256 and not any(ord(c) < 32 for c in value) else ''
 
 
-def read_story_details(epub_path):
+def read_story_details(epub_path, _on_error=None):
     """Return {ok, status, date_updated, status_source, date_updated_source}.
 
     A readable EPUB with no known details is still successful. Failure messages are
@@ -96,6 +96,7 @@ def read_story_details(epub_path):
             if value:
                 result[key], result[key + '_source'] = value, source
         return result
-    except Exception:
+    except Exception as exc:
+        epub_editor._notify_read_error(_on_error, exc)
         result.update(ok=False, error='EPUB story details could not be read.')
         return result

@@ -41,20 +41,7 @@ internal class LibraryFacetIndexDatabase(context: Context) {
         val database = helper.writableDatabase
         database.beginTransaction()
         try {
-            database.compileStatement(UPSERT_SQL).use { statement ->
-                for (entry in entries) {
-                    val payload = LibraryFacetPayload.encode(entry.record)
-                    val checksum = LibraryFacetPayload.rowChecksum(
-                        entry.record.path, entry.bookSignature, entry.fileSignature, payload)
-                    statement.clearBindings()
-                    statement.bindString(1, entry.record.path)
-                    statement.bindString(2, entry.bookSignature)
-                    statement.bindString(3, entry.fileSignature)
-                    statement.bindBlob(4, payload)
-                    statement.bindBlob(5, checksum)
-                    statement.executeInsert()
-                }
-            }
+            writeEntries(database, entries)
             database.setTransactionSuccessful()
         } finally {
             database.endTransaction()
@@ -67,21 +54,56 @@ internal class LibraryFacetIndexDatabase(context: Context) {
         val database = helper.writableDatabase
         database.beginTransaction()
         try {
-            database.execSQL(CREATE_KEEP_SQL)
-            database.execSQL(CLEAR_KEEP_SQL)
-            database.compileStatement(INSERT_KEEP_SQL).use { statement ->
-                for (path in paths) {
-                    statement.clearBindings()
-                    statement.bindString(1, path)
-                    statement.executeInsert()
-                }
-            }
-            database.execSQL(REMOVE_EXCEPT_SQL)
-            database.execSQL(CLEAR_KEEP_SQL)
+            removeExcept(database, paths)
             database.setTransactionSuccessful()
         } finally {
             database.endTransaction()
         }
+    }
+
+    /** The complete accepted manual snapshot, replacements AND pruning, has one commit. */
+    @Synchronized
+    fun replaceSnapshot(entries: Collection<LibraryFacetIndexEntry>) {
+        val database = helper.writableDatabase
+        database.beginTransaction()
+        try {
+            writeEntries(database, entries)
+            removeExcept(database, entries.mapTo(hashSetOf()) { it.record.path })
+            database.setTransactionSuccessful()
+        } finally {
+            database.endTransaction()
+        }
+    }
+
+    private fun writeEntries(database: SQLiteDatabase, entries: Collection<LibraryFacetIndexEntry>) {
+        database.compileStatement(UPSERT_SQL).use { statement ->
+            for (entry in entries) {
+                val payload = LibraryFacetPayload.encode(entry.record)
+                val checksum = LibraryFacetPayload.rowChecksum(
+                    entry.record.path, entry.bookSignature, entry.fileSignature, payload)
+                statement.clearBindings()
+                statement.bindString(1, entry.record.path)
+                statement.bindString(2, entry.bookSignature)
+                statement.bindString(3, entry.fileSignature)
+                statement.bindBlob(4, payload)
+                statement.bindBlob(5, checksum)
+                statement.executeInsert()
+            }
+        }
+    }
+
+    private fun removeExcept(database: SQLiteDatabase, paths: Set<String>) {
+        database.execSQL(CREATE_KEEP_SQL)
+        database.execSQL(CLEAR_KEEP_SQL)
+        database.compileStatement(INSERT_KEEP_SQL).use { statement ->
+            for (path in paths) {
+                statement.clearBindings()
+                statement.bindString(1, path)
+                statement.executeInsert()
+            }
+        }
+        database.execSQL(REMOVE_EXCEPT_SQL)
+        database.execSQL(CLEAR_KEEP_SQL)
     }
 
     @Synchronized

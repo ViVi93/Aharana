@@ -97,7 +97,14 @@ class BulkUiContractTests(unittest.TestCase):
         body = source.split('private suspend fun scheduleUserWork(', 1)[-1].split('suspend fun enqueueDownload(', 1)[0]
         self.assertTrue('status = "failed"' in body and 'work_submission_failed' in body)
         self.assertTrue('enqueueUniqueWork(workName' in body)
-        self.assertEqual(source.count('scheduleUserWork(jobId, requestWorkId, work)'), 3)
+        for name, next_marker in (
+                ('enqueueDownload', 'suspend fun enqueueUpdate('),
+                ('enqueueUpdate', 'suspend fun enqueueForceDownload('),
+                ('enqueueForceDownload', 'suspend fun enqueueMetadata('),
+                ('enqueueMetadata', '/** Compatibility entry point')):
+            with self.subTest(operation=name):
+                operation = source.split('suspend fun ' + name + '(', 1)[1].split(next_marker, 1)[0]
+                self.assertIn('scheduleUserWork(jobId, requestWorkId, work)', operation)
 
 
 if __name__ == '__main__':

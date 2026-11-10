@@ -5,6 +5,9 @@ import traceback
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _ANDROID_CONFIG_DIR = None
+_FANFICFARE_AVAILABLE = None
+_FANFICFARE_ERROR = None
+_FANFICFARE_TRACEBACK = None
 
 
 def set_config_dir(path):
@@ -278,10 +281,6 @@ def _get_fanficfare_version():
 
 def _import_fanficfare():
     global _FANFICFARE_AVAILABLE, _FANFICFARE_ERROR, _FANFICFARE_TRACEBACK
-    if "_FANFICFARE_AVAILABLE" not in globals():
-        _FANFICFARE_AVAILABLE = None
-        _FANFICFARE_ERROR = None
-        _FANFICFARE_TRACEBACK = None
     if _FANFICFARE_AVAILABLE is not None:
         return _FANFICFARE_AVAILABLE
     try:

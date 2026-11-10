@@ -3,7 +3,6 @@ package com.vivi.aharana
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.lifecycle.LiveData
-import androidx.lifecycle.MediatorLiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.room.withTransaction
 import androidx.work.Constraints
@@ -18,6 +17,7 @@ import java.util.concurrent.TimeUnit
 import com.vivi.aharana.data.local.AppDatabase
 import com.vivi.aharana.data.local.BookDao
 import com.vivi.aharana.data.local.BookEntity
+import com.vivi.aharana.data.local.LibraryBookRow
 import com.vivi.aharana.data.local.DownloadJobDao
 import com.vivi.aharana.data.local.DownloadJobEntity
 import com.vivi.aharana.model.BookItem
@@ -44,10 +44,25 @@ class BookRepository(context: Context) {
     private val bookDao = database.bookDao()
     private val downloadJobDao = database.downloadJobDao()
     val jobDao: com.vivi.aharana.data.local.DownloadJobDao = downloadJobDao
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val processState = sharedState.get { LibraryState() }
+    private val scope = processState.scope
     private val prefs: SharedPreferences = context.getSharedPreferences("fanficfare_prefs", Context.MODE_PRIVATE)
 
     companion object {
+        private class LibraryState {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val books = MutableLiveData<List<BookItem>>(emptyList())
+            val jobs = MutableLiveData<List<DownloadJobEntity>>(emptyList())
+            val started = ProcessValue<Unit>()
+            val writes = LibraryWrites()
+        }
+        private val sharedState = ProcessValue<LibraryState>()
+        private val instance = ProcessValue<BookRepository>()
+
+        /** Application-owned repository. Legacy wrappers also share this subscription/state. */
+        fun getInstance(context: Context): BookRepository =
+            instance.get { BookRepository(context.applicationContext) }
+
         private val metadataScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val metadataSubmissionMutex = Mutex()
         private val metadataGeneration = java.util.concurrent.atomic.AtomicInteger(0)
@@ -75,21 +90,21 @@ class BookRepository(context: Context) {
                 database.withTransaction {
                     for (i in 0 until deletedBooks.length()) {
                         val deletion = deletedBooks.getJSONObject(i)
-                        val current = bookDao.findById(deletion.optLong("book_id"))
+                        val current = bookDao.findRowById(deletion.optLong("book_id"))
                         // Never delete a replacement row merely because it reused a path.
-                        if (current != null && current.filePath == deletion.getString("path")) bookDao.delete(current)
+                        if (current != null && current.filePath == deletion.getString("path")) bookDao.deleteById(current.id)
                     }
                     for (book in bookDao.getAll()) {
                         val (path, source) = remapOrganisedPaths(book.filePath, book.sourcePath, moves)
                         if (path != book.filePath || source != book.sourcePath) {
-                            bookDao.update(book.copy(filePath = path, sourcePath = source))
+                            bookDao.updatePaths(book.id, path, source)
                         }
                     }
                     for (job in jobDao.getAll()) {
                         val input = job.inputPath?.let { moves[it] ?: it }
                         val output = job.outputPath?.let { moves[it] ?: it }
                         if (input != job.inputPath || output != job.outputPath) {
-                            jobDao.update(job.copy(inputPath = input, outputPath = output))
+                            jobDao.updatePaths(job.id, job.workId, input, output)
                         }
                     }
                 }
@@ -111,44 +126,56 @@ class BookRepository(context: Context) {
         private const val RECONCILE_GRACE_MS = 2 * 60 * 1000L
     }
 
-    private val _books = MutableLiveData<List<BookItem>>(emptyList())
+    private val _books = processState.books
     val books: LiveData<List<BookItem>> = _books
-    private val _latestJobs: MediatorLiveData<List<DownloadJobEntity>> = MediatorLiveData<List<DownloadJobEntity>>().apply {
-        android.util.Log.d("FFF-UI-OBS", "BookRepository latestJobs mediator init")
-        addSource(downloadJobDao.observeAll()) { value = it }
-    }
+    private val _latestJobs = processState.jobs
     val latestJobs: LiveData<List<DownloadJobEntity>> = _latestJobs
 
     init {
-        android.util.Log.d("FFF-UI-OBS", "BookRepository init starting")
-        scope.launch {
-            migrateIfNeeded()
-            val initialEntities = bookDao.getAll()
-            _books.postValue(initialEntities.map { it.toBookItem() })
-            withContext(kotlinx.coroutines.Dispatchers.Main) {
-                android.util.Log.d("FFF-UI-OBS", "BookRepository init observing books")
-                bookDao.observeAll().observeForever { entities ->
-                    _books.postValue(entities.map { it.toBookItem() })
-                }
-                android.util.Log.d("FFF-UI-OBS", "BookRepository init observing jobs")
-                downloadJobDao.observeAll().observeForever { jobs ->
-                    android.util.Log.d("FFF-UI-OBS", "BookRepository job observer fired count=${jobs.size}")
-                    _latestJobs.postValue(jobs)
-                }
-            }
-            // Keep the cached shelf usable while a worker owns storage during network I/O.
-            // All file mutations resolve recovery again under the same gate before acting.
-            try {
-                LibraryStorageGate.run {
-                    reconcileOrganisedPaths(context)
-                    reconcileStaleRunningJobs()
-                }
-            } catch (e: Exception) {
-                DiagnosticLog.appendException(context, "Library.Organise", "recovery_failed", e)
+        processState.started.get {
+            android.util.Log.d("FFF-UI-OBS", "BookRepository init starting")
+            scope.launch {
+                migrateIfNeeded()
                 withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(context, "File organisation recovery needs attention: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                    // Intentionally process-owned: no Activity/repository wrapper can
+                    // install a second permanent Room subscription.
+                    android.util.Log.d("FFF-UI-OBS", "BookRepository init observing books")
+                    bookDao.observeAll().observeForever { entities ->
+                        _books.postValue(entities.map { it.toBookItem() })
+                    }
+                    android.util.Log.d("FFF-UI-OBS", "BookRepository init observing jobs")
+                    downloadJobDao.observeAll().observeForever { jobs ->
+                        android.util.Log.d("FFF-UI-OBS", "BookRepository job observer fired count=${jobs.size}")
+                        _latestJobs.postValue(jobs)
+                    }
+                }
+                // Projections are safe even before cleanup; keep the shelf and storage recovery
+                // independent of legacy history size. Process-owned startup runs this only once.
+                scope.launch {
+                    try {
+                        val count = QueueHistory.compactLegacy(downloadJobDao)
+                        DiagnosticLog.append(context, "Queue.History", "compacted_rows=$count")
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        DiagnosticLog.appendException(context, "Queue.History", "compaction_failed", e)
+                    }
+                }
+                // Keep the cached shelf usable while a worker owns storage during network I/O.
+                // All file mutations resolve recovery again under the same gate before acting.
+                try {
+                    LibraryStorageGate.run {
+                        reconcileOrganisedPaths(context)
+                        reconcileStaleRunningJobs()
+                    }
+                } catch (e: Exception) {
+                    DiagnosticLog.appendException(context, "Library.Organise", "recovery_failed", e)
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(context, "File organisation recovery needs attention: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                    }
                 }
             }
+            Unit
         }
     }
 
@@ -167,7 +194,7 @@ class BookRepository(context: Context) {
     private suspend fun reconcileStaleRunningJobs() = withContext(Dispatchers.IO) {
         try {
             val workManager = WorkManager.getInstance(context)
-            cleanFailedRowsForLibraryBooks()
+
             val stale = downloadJobDao.getByStatus("running") +
                 downloadJobDao.getByStatus("queued") +
                 downloadJobDao.getByStatus(FanFicFareWorker.STATUS_WAITING)
@@ -194,15 +221,15 @@ class BookRepository(context: Context) {
                     when (live.state) {
                         androidx.work.WorkInfo.State.SUCCEEDED -> {
                             if (outputIsUsable(job)) {
-                                downloadJobDao.update(job.copy(status = "success", finishedAt = System.currentTimeMillis()))
+                                downloadJobDao.updateFromWorker(job.copy(status = "success", finishedAt = System.currentTimeMillis()))
                             } else {
-                                downloadJobDao.update(job.copy(status = "failed", error = "stale_recovery_missing_output", finishedAt = System.currentTimeMillis()))
+                                downloadJobDao.updateFromWorker(job.copy(status = "failed", error = "stale_recovery_missing_output", finishedAt = System.currentTimeMillis()))
                             }
                         }
                         androidx.work.WorkInfo.State.FAILED ->
-                            downloadJobDao.update(job.copy(status = "failed", error = "workmanager_failed", finishedAt = System.currentTimeMillis()))
+                            downloadJobDao.updateFromWorker(job.copy(status = "failed", error = "workmanager_failed", finishedAt = System.currentTimeMillis()))
                         androidx.work.WorkInfo.State.CANCELLED ->
-                            downloadJobDao.update(job.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
+                            markInterrupted(job, "WorkManager stopped this request. Retry to resume.")
                         // ENQUEUED / BLOCKED / RUNNING: still genuinely in flight
                         else -> {}
                     }
@@ -215,44 +242,6 @@ class BookRepository(context: Context) {
         }
     }
 
-    /**
-     * Drop failed rows for stories that are already in the library.
-     *
-     * A failed row whose story downloaded later (or in an earlier attempt) is pure
-     * noise: the book is on the shelf and the row only offers Retry/Remove for work
-     * that is already done. This is what leaves a downloaded book sitting in the
-     * queue as an error. Only download rows whose stored file still exists are
-     * cleared, so a genuinely failed download with no book behind it keeps its row.
-     */
-    private suspend fun cleanFailedRowsForLibraryBooks() {
-        try {
-            val failed = downloadJobDao.getByStatus("failed")
-                .filter { it.type == "download" && !it.inputUrl.isNullOrBlank() }
-            if (failed.isEmpty()) return
-            // Match on a normalised URL: the library stores whatever the EPUB's
-            // <dc:source> says, which can differ from the shared URL by scheme,
-            // "www.", query string or trailing slash.
-            val library = HashMap<String, BookEntity>()
-            for (book in bookDao.getAll()) {
-                val url = book.url?.ifBlank { null } ?: continue
-                library[normalizeStoryUrl(url)] = book
-            }
-            var cleared = 0
-            for (job in failed) {
-                val book = library[normalizeStoryUrl(job.inputUrl!!)] ?: continue
-                val path = book.filePath?.ifBlank { null } ?: continue
-                val file = java.io.File(path)
-                if (!file.exists() || !file.isFile || file.length() <= 0L) continue
-                downloadJobDao.update(job.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
-                cleared++
-            }
-            if (cleared > 0) {
-                DiagnosticLog.append(context, "Queue.Reconcile", "cleared_failed_rows count=$cleared")
-            }
-        } catch (e: Exception) {
-            DiagnosticLog.appendException(context, "Queue.Reconcile", "clear_failed_rows_failed", e)
-        }
-    }
 
     private fun normalizeStoryUrl(url: String): String {
         var value = url.trim().lowercase()
@@ -277,10 +266,10 @@ class BookRepository(context: Context) {
         if (job.status == "success" || job.status == "cancelled") return
         val now = System.currentTimeMillis()
         if (outputIsUsable(job)) {
-            downloadJobDao.update(job.copy(status = "success", finishedAt = now))
+            downloadJobDao.updateFromWorker(job.copy(status = "success", finishedAt = now))
             DiagnosticLog.append(context, "Queue.Reconcile", "jobId=${job.id} success_output_present")
         } else {
-            downloadJobDao.update(job.copy(status = "failed", error = reason, finishedAt = now))
+            downloadJobDao.updateFromWorker(job.copy(status = "failed", error = reason, finishedAt = now))
             DiagnosticLog.append(context, "Queue.Reconcile", "jobId=${job.id} failed reason=$reason")
         }
     }
@@ -292,7 +281,7 @@ class BookRepository(context: Context) {
     suspend fun updateDownloadJobStatus(jobId: Long, status: String, finishedAt: Long) {
         withContext(Dispatchers.IO) {
             val job = downloadJobDao.getById(jobId)
-            if (job != null) downloadJobDao.update(job.copy(status = status, finishedAt = finishedAt))
+            if (job != null) downloadJobDao.updateFromWorker(job.copy(status = status, finishedAt = finishedAt))
         }
     }
 
@@ -321,12 +310,12 @@ class BookRepository(context: Context) {
         android.util.Log.d("FFF-Dup", msg)
         DiagnosticLog.append(context, "FFF-Dup", msg)
         if (idx >= 0) {
-            list[idx] = book
+            list[idx] = book.copy(coverUriString = null)
             val msg2 = "addOrUpdate replaced_at=$idx"
             android.util.Log.d("FFF-Dup", msg2)
             DiagnosticLog.append(context, "FFF-Dup", msg2)
         } else {
-            list.add(0, book)
+            list.add(0, book.copy(coverUriString = null))
             val msg2 = "addOrUpdate appended"
             android.util.Log.d("FFF-Dup", msg2)
             DiagnosticLog.append(context, "FFF-Dup", msg2)
@@ -335,18 +324,19 @@ class BookRepository(context: Context) {
         val msg3 = "addOrUpdate sizeAfter=${list.size}"
         android.util.Log.d("FFF-Dup", msg3)
         DiagnosticLog.append(context, "FFF-Dup", msg3)
-        scope.launch {
-            upsertBookEntity(book)
+        processState.writes.launch(scope) {
+            LibraryStorageGate.run { upsertBookEntity(book) }
         }
     }
 
     fun updateBook(oldBook: BookItem, newBook: BookItem) {
         val list = (_books.value ?: emptyList()).toMutableList()
         val idx = findByIdentity(oldBook)
-        if (idx >= 0) list[idx] = newBook else list.add(0, newBook)
+        val shelfBook = newBook.copy(coverUriString = null)
+        if (idx >= 0) list[idx] = shelfBook else list.add(0, shelfBook)
         _books.value = list
-        scope.launch {
-            upsertBookEntity(newBook)
+        processState.writes.launch(scope) {
+            LibraryStorageGate.run { upsertBookEntity(newBook) }
         }
     }
 
@@ -355,16 +345,19 @@ class BookRepository(context: Context) {
         val removed = list.removeAll { it.uriString == book.uriString }
         _books.value = list
         if (removed) {
-            scope.launch {
-                findByExisting(book)?.let { bookDao.delete(it) }
+            processState.writes.launch(scope) {
+                LibraryStorageGate.run {
+                    if (book.libraryId > 0) bookDao.deleteById(book.libraryId)
+                    else findByExisting(book)?.let { bookDao.deleteById(it.id) }
+                }
             }
         }
     }
 
     fun clear() {
         _books.value = emptyList()
-        scope.launch {
-            bookDao.clear()
+        processState.writes.launch(scope) {
+            LibraryStorageGate.run { bookDao.clear() }
         }
     }
 
@@ -372,11 +365,14 @@ class BookRepository(context: Context) {
         val msg = "setBooks count=${newBooks.size}"
         android.util.Log.d("FFF-Dup", msg)
         DiagnosticLog.append(context, "FFF-Dup", msg)
-        _books.value = newBooks.toList()
-        scope.launch {
-            database.withTransaction {
-                bookDao.clear()
-                bookDao.insertAll(newBooks.map { it.toEntity() })
+        // A snapshot's omissions are not deletions: workers may have inserted rows
+        // since it was taken. Deletion must use remove/clear or an exact row mutation.
+        _books.value = newBooks.map { it.copy(coverUriString = null) }
+        processState.writes.launch(scope) {
+            LibraryStorageGate.run {
+                database.withTransaction {
+                    newBooks.forEach { upsertBookEntity(it) }
+                }
             }
         }
     }
@@ -389,7 +385,7 @@ class BookRepository(context: Context) {
                 val row = rows.getJSONObject(i)
                 val path = row.optString("path")
                 if (path.isBlank() || !seen.add(path)) continue
-                val existing = bookDao.findByFilePath(path)
+                val existing = bookDao.findRowByFilePath(path)
                 val book = BookEntity(
                     id = existing?.id ?: 0,
                     title = row.optString("title", "untitled"),
@@ -403,7 +399,10 @@ class BookRepository(context: Context) {
                     chapters = row.optInt("chapters"),
                     addedAt = existing?.addedAt ?: System.currentTimeMillis()
                 )
-                if (existing != null) bookDao.update(book) else bookDao.insert(book)
+                if (existing != null) {
+                    bookDao.updateMetadata(existing.id, book.title, book.author, book.url, book.filePath,
+                        book.sourcePath, book.lastModified, book.sizeBytes, book.chapters, book.coverData)
+                } else bookDao.insert(book)
             }
         }
         seen.size
@@ -414,39 +413,40 @@ class BookRepository(context: Context) {
         val msg = "loadLibrary entityCount=${entities.size}"
         android.util.Log.d("FFF-Dup", msg)
         DiagnosticLog.append(context, "FFF-Dup", msg)
-        _books.value = entities.map { it.toBookItem() }
+        withContext(Dispatchers.Main) { _books.value = entities.map { it.toBookItem() } }
         return true
     }
 
     /**
      * Insert or update a single book row, leaving the in-memory list alone.
      *
-     * Safe to call from a background worker that owns its own repository instance:
-     * unlike [addOrUpdate] it never assigns the LiveData (main thread only), and
-     * unlike [saveLibrary] it never clears the table.
+     * Background entry point for callers already holding storage exclusion.
+     * Unlike [addOrUpdate] it never assigns LiveData (main thread only).
      */
     suspend fun upsertBook(book: BookItem) {
         upsertBookEntity(book)
     }
 
     suspend fun saveLibrary(): Boolean {
-        val books = _books.value ?: return false
-        withContext(Dispatchers.IO) {
-            database.withTransaction {
-                bookDao.clear()
-                bookDao.insertAll(books.map { it.toEntity() })
-            }
+        // Every mutation persists individually. Await writes submitted before this
+        // call, never publish older shelf metadata over a worker/organisation commit.
+        processState.writes.awaitPending()
+        return withContext(Dispatchers.IO) {
+            database.withTransaction { bookDao.count() >= 0 }
         }
-        return true
     }
 
     private suspend fun upsertBookEntity(book: BookItem) {
         withContext(Dispatchers.IO) {
-            val existing = findByExisting(book)
-            if (existing != null) {
-                bookDao.update(book.toEntity(now = existing.addedAt))
-            } else {
-                bookDao.insert(book.toEntity())
+            database.withTransaction {
+                val existing = findByExisting(book)
+                if (existing != null) {
+                    bookDao.updateMetadata(existing.id, book.title, book.author, book.url.ifBlank { null },
+                        book.uriString, book.sourceUriString, book.lastModified, book.sizeBytes,
+                        book.chapters, book.coverUriString)
+                } else {
+                    bookDao.insert(book.toEntity())
+                }
             }
         }
     }
@@ -459,15 +459,21 @@ class BookRepository(context: Context) {
      * the work it was merged from). Matching URL-first meant registering a merge
      * found the base book's row and updated it, so the merged book never appeared.
      */
-    private suspend fun findByExisting(book: BookItem): BookEntity? {
+    private suspend fun findByExisting(book: BookItem): LibraryBookRow? {
         return withContext(Dispatchers.IO) {
+            // Positive IDs are mandatory identity, never a hint to select a replacement.
+            if (book.libraryId > 0) {
+                return@withContext checkNotNull(bookDao.findRowById(book.libraryId)) {
+                    "Book is no longer in the library"
+                }
+            }
             val normalizedPath = book.uriString.trim()
             if (normalizedPath.isNotBlank()) {
-                bookDao.findByFilePath(normalizedPath)?.let { return@withContext it }
+                bookDao.findRowByFilePath(normalizedPath)?.let { return@withContext it }
             }
             val normalizedUrl = book.url.trim().ifBlank { null }
             if (!normalizedUrl.isNullOrBlank()) {
-                bookDao.findByUrl(normalizedUrl)?.let { return@withContext it }
+                bookDao.findRowByUrl(normalizedUrl)?.let { return@withContext it }
             }
             null
         }
@@ -478,7 +484,7 @@ class BookRepository(context: Context) {
             if (prefs.getBoolean("library_migrated_v1", false)) {
                 return@withContext
             }
-            if (bookDao.getAll().isNotEmpty()) {
+            if (bookDao.count() > 0) {
                 prefs.edit().putBoolean("library_migrated_v1", true).apply()
                 return@withContext
             }
@@ -593,9 +599,9 @@ class BookRepository(context: Context) {
                     if (generation != metadataGeneration.get()) break
                     if (index > 0 && index % 5 == 0) kotlinx.coroutines.delay(200)
                     val old = latest[url]
-                    val successful = old?.status == "success" && try {
-                        JSONObject(old.resultJson ?: "{}").optBoolean("ok")
-                    } catch (_: Exception) { false }
+                    // Metadata success is committed only for ok=true. Bulk rows intentionally
+                    // omit response bodies; do not refetch completed metadata just for its cover.
+                    val successful = old?.status == "success"
                     val live = old?.workId?.let { name ->
                         manager.getWorkInfosForUniqueWork(name).get().any { !it.state.isFinished }
                     } ?: false
@@ -636,12 +642,9 @@ class BookRepository(context: Context) {
         metadataScope.launch {
             try {
                 metadataSubmissionMutex.withLock {
-                    WorkManager.getInstance(context).cancelAllWorkByTag("fanficfare_metadata").result.get()
                     downloadJobDao.getAll().filter {
                         it.type == "metadata" && it.status in setOf("queued", "waiting", "running")
-                    }.forEach { row ->
-                        downloadJobDao.update(row.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
-                    }
+                    }.forEach { row -> cancelJobAwaited(row) }
                 }
             } catch (e: Exception) {
                 DiagnosticLog.appendException(context, "BulkMetadata", "cancel_failed", e)
@@ -655,7 +658,7 @@ class BookRepository(context: Context) {
         } catch (e: Exception) {
             withContext(NonCancellable + Dispatchers.IO) {
                 downloadJobDao.getById(jobId)?.let { current ->
-                    if (current.status == "queued") downloadJobDao.update(current.copy(status = "failed",
+                    if (current.status == "queued" && current.workId == workName) downloadJobDao.updateFromWorker(current.copy(status = "failed",
                         error = "work_submission_failed", finishedAt = System.currentTimeMillis()))
                 }
             }
@@ -805,7 +808,7 @@ class BookRepository(context: Context) {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag("fanficfare_metadata")
             .build()
-        WorkManager.getInstance(context).enqueue(work)
+        scheduleUserWork(jobId, requestWorkId, work)
         return jobId
     }
 
@@ -815,33 +818,17 @@ class BookRepository(context: Context) {
     suspend fun getJob(jobId: Long): DownloadJobEntity? = downloadJobDao.getById(jobId)
 
     fun cancelCurrentDownload() {
-        DiagnosticLog.append(context, "Main.Cancel", "cancel_start")
-        try {
-            // Downloads/updates/force-downloads each carry their own random unique
-            // work name, so cancelling by name only ever hit update/force-download.
-            // Cancel by tag so a queued or waiting download actually stops too.
-            WorkManager.getInstance(context).cancelAllWorkByTag(FanFicFareWorker.TAG_DOWNLOAD)
-            WorkManager.getInstance(context).cancelAllWorkByTag(FanFicFareWorker.TAG_UPDATE)
-            WorkManager.getInstance(context).cancelAllWorkByTag(FanFicFareWorker.TAG_FORCE_DOWNLOAD)
-            WorkManager.getInstance(context).cancelUniqueWork(FanFicFareWorker.UNIQUE_WORK_NAME)
-            DiagnosticLog.append(context, "Main.Cancel", "workmanager_cancelled")
-        } catch (e: Exception) {
-            DiagnosticLog.appendException(context, "Main.Cancel", "workmanager_cancel_failed", e)
-            android.util.Log.e("FFF-Cancel", "cancel failed", e)
-        }
         scope.launch(Dispatchers.IO) {
             try {
-                val dao = database.downloadJobDao()
-                val stale = dao.getByStatus("running") +
-                    dao.getByStatus("queued") +
-                    dao.getByStatus(FanFicFareWorker.STATUS_WAITING)
-                val cancelled = stale
-                    .filter { setOf("download", "update", "force_download").contains(it.type) }
-                    .map { it.copy(status = "cancelled", finishedAt = System.currentTimeMillis()) }
-                cancelled.forEach { dao.update(it) }
-                DiagnosticLog.append(context, "Main.Cancel", "db_updated count=${cancelled.size}")
+                val active = downloadJobDao.getAll().filter {
+                    it.type in setOf("download", "update", "force_download") &&
+                        it.status in setOf("queued", "waiting", "running", "failed")
+                }
+                // Cancel the snapshot by name, not tags: newly submitted work must not be
+                // stopped without first persisting explicit cancellation on its own row.
+                active.forEach { cancelJobAwaited(it) }
             } catch (e: Exception) {
-                DiagnosticLog.appendException(context, "Main.Cancel", "db_update_failed", e)
+                DiagnosticLog.appendException(context, "Main.Cancel", "cancel_failed", e)
             }
         }
     }
@@ -857,39 +844,65 @@ class BookRepository(context: Context) {
      * local copy is already current). Force download stays an explicit action on the
      * book's detail screen.
      */
-    suspend fun retryJob(job: DownloadJobEntity): String {
-        DiagnosticLog.append(context, "Queue.Retry", "jobId=${job.id} type=${job.type}")
-        return when (job.type) {
+    suspend fun retryJob(job: DownloadJobEntity): String = withContext(NonCancellable + Dispatchers.IO) {
+        val current = downloadJobDao.getById(job.id) ?: return@withContext "none"
+        if (current.status !in setOf("failed", "cancelled")) return@withContext "none"
+        var replacement = current
+        when (current.type) {
             "download" -> {
-                val url = job.inputUrl?.ifBlank { null } ?: return "none"
+                val url = current.inputUrl?.takeIf { it.isNotBlank() } ?: return@withContext "none"
                 val book = libraryBookForUrl(url)
                 if (book != null) {
-                    DiagnosticLog.append(
-                        context,
-                        "Queue.Retry",
-                        "download_row_retried_as_update jobId=${job.id} bookId=${book.id}"
-                    )
-                    enqueueUpdate(book.id, book.filePath)
-                    "update"
-                } else {
-                    enqueueDownload(url)
-                    "download"
+                    replacement = current.copy(type = "update", bookId = book.id, inputPath = book.filePath)
                 }
             }
-            "update" -> {
-                job.inputPath?.let { enqueueUpdate(job.bookId, it) }
-                "update"
-            }
-            "force_download" -> {
-                job.inputPath?.let { enqueueForceDownload(job.bookId, it) }
-                "force"
+            "update", "force_download" -> {
+                if (current.inputPath.isNullOrBlank()) return@withContext "none"
             }
             "metadata" -> {
-                job.inputUrl?.let { enqueueMetadata(it) }
-                "metadata"
+                if (current.inputUrl.isNullOrBlank()) return@withContext "none"
             }
-            else -> "none"
+            else -> return@withContext "none"
         }
+        val action = if (replacement.type == "force_download") "force" else replacement.type
+        val workName = UUID.randomUUID().toString()
+        replacement = replacement.copy(workId = workName, status = "queued", error = null,
+            resultJson = null, outputPath = null, finishedAt = null)
+        val tag = when (replacement.type) {
+            "download" -> FanFicFareWorker.TAG_DOWNLOAD
+            "update" -> FanFicFareWorker.TAG_UPDATE
+            "force_download" -> FanFicFareWorker.TAG_FORCE_DOWNLOAD
+            else -> "fanficfare_metadata"
+        }
+        val work = OneTimeWorkRequestBuilder<FanFicFareWorker>()
+            .setInputData(workDataOf(FanFicFareWorker.KEY_TYPE to replacement.type,
+                FanFicFareWorker.KEY_URL to replacement.inputUrl.orEmpty(),
+                FanFicFareWorker.KEY_INPUT_PATH to replacement.inputPath.orEmpty(),
+                FanFicFareWorker.KEY_BOOK_ID to replacement.bookId,
+                FanFicFareWorker.KEY_WORK_ID to workName))
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .addTag(tag).build()
+        QueueJobPolicy.retryReplacement(action, claim = {
+            downloadJobDao.claimRetry(current.id, current.workId, workName, replacement.type,
+                replacement.bookId, replacement.inputUrl, replacement.inputPath, System.currentTimeMillis()) > 0
+        }, submit = {
+            try {
+                // The claim changed the row's work identity first, fencing every old
+                // worker write. No second row or hidden/pending claim can be orphaned.
+                current.workId?.takeIf(String::isNotBlank)?.let {
+                    WorkManager.getInstance(context).cancelUniqueWork(it).result.get()
+                }
+                scheduleUserWork(current.id, workName, work)
+                DiagnosticLog.append(context, "Queue.Retry",
+                    "submitted job_id=${current.id} old_work_name=${current.workId} work_name=$workName")
+            } catch (e: Exception) {
+                downloadJobDao.updateFromWorker(replacement.copy(status = "failed",
+                    error = "Retry could not be submitted (${e.javaClass.simpleName}). Retry again or remove it.",
+                    finishedAt = System.currentTimeMillis()))
+                throw e
+            }
+        })
     }
 
     /**
@@ -897,7 +910,7 @@ class BookRepository(context: Context) {
      * library stores the URL from the EPUB's <dc:source>, so the comparison is on
      * the normalised form (see [normalizeStoryUrl]).
      */
-    private suspend fun libraryBookForUrl(url: String): BookEntity? {
+    private suspend fun libraryBookForUrl(url: String): LibraryBookRow? {
         val target = normalizeStoryUrl(url)
         for (book in bookDao.getAll()) {
             val bookUrl = book.url?.ifBlank { null } ?: continue
@@ -910,39 +923,31 @@ class BookRepository(context: Context) {
     }
 
     fun cancelJob(job: DownloadJobEntity) {
-        DiagnosticLog.append(context, "Queue.Cancel", "jobId=${job.id} type=${job.type}")
-        // Cancel the actual WorkManager work, not just the Room row. Jobs are
-        // enqueued with requestWorkId as their unique work name, and that value is
-        // what DownloadJobEntity.workId stores. Without this the worker kept
-        // running (and re-inserted its row when it started), so "Remove"/"Retry"
-        // never really stopped anything.
-        val workName = job.workId?.ifBlank { null }
-        if (workName != null) {
-            try {
-                WorkManager.getInstance(context).cancelUniqueWork(workName)
-                DiagnosticLog.append(context, "Queue.Cancel", "workmanager_cancelled name=$workName")
-            } catch (e: Exception) {
-                DiagnosticLog.appendException(context, "Queue.Cancel", "workmanager_cancel_failed", e)
-            }
-        } else {
-            DiagnosticLog.append(context, "Queue.Cancel", "no_workid jobId=${job.id}")
-        }
         scope.launch(Dispatchers.IO) {
             try {
-                val current = downloadJobDao.getById(job.id)
-                if (current != null) {
-                    downloadJobDao.update(
-                        current.copy(
-                            status = "cancelled",
-                            finishedAt = System.currentTimeMillis()
-                        )
-                    )
-                    DiagnosticLog.append(context, "Queue.Cancel", "db_updated jobId=${job.id}")
-                }
+                cancelJobAwaited(job)
             } catch (e: Exception) {
-                DiagnosticLog.appendException(context, "Queue.Cancel", "db_failed", e)
+                DiagnosticLog.appendException(context, "Queue.Cancel", "cancel_failed", e)
             }
         }
+    }
+
+    private suspend fun cancelJobAwaited(job: DownloadJobEntity) = withContext(NonCancellable + Dispatchers.IO) {
+        val current = downloadJobDao.getById(job.id) ?: return@withContext
+        if (current.workId != job.workId) return@withContext // A later Retry owns a new request.
+        val active = setOf("queued", "waiting", "running")
+        val includeInterrupted = job.status in active || current.status in active ||
+            (current.status == "failed" && current.workId?.takeIf(String::isNotBlank)?.let { name ->
+                WorkManager.getInstance(context).getWorkInfosForUniqueWork(name).get().any { !it.state.isFinished }
+            } == true)
+        val changed = downloadJobDao.cancelActive(job.id, current.workId, includeInterrupted,
+            "Cancelled by user. Retry to resume.", System.currentTimeMillis())
+        if (changed == 0) return@withContext // A fresh success must remain success.
+        DiagnosticLog.append(context, "Queue.Cancel",
+            "intent_persisted job_id=${job.id} work_name=${current.workId}")
+        val workName = current.workId?.takeIf { it.isNotBlank() } ?: return@withContext
+        WorkManager.getInstance(context).cancelUniqueWork(workName).result.get()
+        DiagnosticLog.append(context, "Queue.Cancel", "stop_requested job_id=${job.id} work_name=$workName")
     }
 
     fun hasRunningJob(): Boolean {

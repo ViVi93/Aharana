@@ -13,9 +13,12 @@ import warnings
 from collections import defaultdict
 from zipfile import ZipFile, ZIP_STORED, ZIP_DEFLATED
 from xml.dom.minidom import parseString
+import json
 
 # py2 vs py3 transition
 from .ensure import ensure_text
+from .htmlcleanup import removeAllEntities
+
 from io import BytesIO
 
 FONT_EXTS = ('ttf','otf','woff','woff2')
@@ -122,6 +125,27 @@ def get_oldcover(epub,relpath,contentdom,item):
         logger.warning("Cover Image %s not found"%src)
         logger.warning("Exception: %s"%(str(e)))
     return None
+
+# <meta name="fff_chapter_data" is json of chapter metadata.
+def _parse_fff_chapter_data(content):
+    # Android compatibility: damaged/custom metadata must not hide usable
+    # legacy chapter URLs/titles or abort update/unnew operations.
+    try:
+        data = json.loads(removeAllEntities(content))
+        if isinstance(data, dict) and all(
+                key not in data or isinstance(data[key], str)
+                for key in ('url', 'title', 'site_title', 'origchapter',
+                            'tocchapter', 'chapter')):
+            return data
+    except (ValueError, TypeError):
+        pass
+    logger.warning('Invalid fff_chapter_data; using legacy chapter metadata')
+    return {}
+
+
+def get_fff_chapter_data(soup):
+    json_metatag = soup.find('meta',{'name':'fff_chapter_data'})
+    return _parse_fff_chapter_data(json_metatag.get('content', '')) if json_metatag else {}
 
 def get_update_data(inputio,
                     getfilecount=True,
@@ -256,34 +280,41 @@ def get_update_data(inputio,
                         for skip in bodysoup.find_all(attrs={'class':'skip_on_ffdl_update'}):
                             skip.extract()
 
-                        ## <meta name="chapterurl" content="${url}"></meta>
                         #print("look for meta chapurl")
-                        currenturl = None
-                        chapurl = soup.find('meta',{'name':'chapterurl'})
-                        if chapurl:
-                            # logger.debug("chapurl['content']:%s"%chapurl['content'])
-                            if chapurl['content'] == "chapter url removed due to failure":
-                                # don't count/include continue_on_chapter_error chapters.
-                                continue
-                            if chapurl['content'] not in urlsoups: # keep first found if more than one.
-                            # print("Found chapurl['content']:%s"%chapurl['content'])
-                                currenturl = chapurl['content']
-                                urlsoups[chapurl['content']] = bodysoup
-                        else:
-                            # for older pre-meta.  Only temp.
-                            chapa = bodysoup.find('a',{'class':'chapterurl'})
-                            if chapa and chapa['href'] not in urlsoups: # keep first found if more than one.
-                                urlsoups[chapa['href']] = bodysoup
-                                currenturl = chapa['href']
-                                chapa.extract()
+                        ## look in fff_chapter_data first.
+                        chapter_data = get_fff_chapter_data(soup)
+                        currenturl = chapter_data.get('url')
+                        # logger.debug("currenturl:%s"%currenturl)
+                        ## <meta name="chapterurl" content="${url}"></meta>
+                        if not currenturl:
+                            chapurltag = soup.find('meta',{'name':'chapterurl'})
+                            if chapurltag:
+                                currenturl = chapurltag['content']
+                                # logger.debug("chapurltag['content']:%s"%chapurltag['content'])
+                        if not currenturl:
+                            # Android compatibility: pre-meta FFDL EPUBs
+                            # stored chapter URLs in a body anchor only.
+                            chapter_anchor = bodysoup.find('a', {'class': 'chapterurl'})
+                            if chapter_anchor:
+                                currenturl = chapter_anchor.get('href')
+                                chapter_anchor.extract()
+                        if currenturl == "chapter url removed due to failure":
+                            # don't count/include continue_on_chapter_error chapters.
+                            continue
+                        if currenturl and currenturl not in urlsoups: # keep first found if more than one.
+                            urlsoups[currenturl] = bodysoup
 
-                        chapterorigtitle = soup.find('meta',{'name':'chapterorigtitle'})
-                        if chapterorigtitle:
-                            datamaps[currenturl]['chapterorigtitle'] = chapterorigtitle['content']
+                        origchapter = soup.find('meta',{'name':'chapterorigtitle'})
+                        if origchapter:
+                            datamaps[currenturl]['origchapter'] = origchapter['content']
 
-                        chaptertitle = soup.find('meta',{'name':'chaptertitle'})
-                        if chaptertitle:
-                            datamaps[currenturl]['chaptertitle'] = chaptertitle['content']
+                        chapter = soup.find('meta',{'name':'chaptertitle'})
+                        if chapter:
+                            datamaps[currenturl]['title'] = chapter['content']
+
+                        # If <meta name="fff_chapter_data" is present,
+                        # it supersedes all individual meta tags.
+                        datamaps[currenturl].update(chapter_data)
 
                         soups.append(bodysoup)
 
@@ -349,9 +380,7 @@ def get_update_data(inputio,
     except:
         pass
 
-    #for k in images.keys():
-        #print("\tlongdesc:%s\n\tData len:%s\n"%(k,len(images[k])))
-    #print("datamaps:%s"%datamaps)
+    # logger.debug(f"{source=} {filecount=} {urlsoups.keys()=} {datamaps.keys()=}")
     return (source,filecount,soups,images,oldcover,calibrebookmark,logfile,urlsoups,datamaps)
 
 def get_path_part(n):
@@ -434,7 +463,7 @@ def get_story_url_from_zip_html(inputio,_is_good_url=None):
     return None
 
 @do_cprofile
-def reset_orig_chapters_epub(inputio,outfile):
+def unnew_chapters_epub(inputio,outfile):
     inputepub = ZipFile(inputio, 'r') # works equally well with a path or a blob
 
     ## build zip in memory in case updating in place(CLI).
@@ -497,55 +526,66 @@ def reset_orig_chapters_epub(inputio,outfile):
                 '''
                 # logger.debug(header)
                 def get_meta_content(n,d):
-                    m = re.match(r'.*<meta( name="%s"| content="(?P<found>[^"]+))+".*'%n,d,re.DOTALL)
+                    m = re.match(r'.*<meta( name="%s"| content="(?P<found>[^"]+)){2}".*'%n,d,re.DOTALL)
                     if m:
                         # logger.debug("%s -> %s"%(n,m.groupdict().get('found',None)))
-                        return m.groupdict().get('found',None)
+                        return removeAllEntities(m.groupdict().get('found',None))
 
-                chapterorigtitle = get_meta_content('chapterorigtitle',header)
-                chaptertoctitle =get_meta_content('chaptertoctitle',header)
-                chaptertitle = get_meta_content('chaptertitle',header)
+                json_str = get_meta_content('fff_chapter_data',header)
+                fff_chapter_data = _parse_fff_chapter_data(json_str) if json_str else {}
+                if all(key in fff_chapter_data for key in
+                       ('origchapter', 'tocchapter', 'chapter', 'mark_new')):
+                    origchapter = fff_chapter_data['origchapter']
+                    tocchapter = fff_chapter_data['tocchapter']
+                    chapter = fff_chapter_data['chapter']
+                    do_unnew = fff_chapter_data['mark_new']
+                else:
+                    # logger.debug("data from old tags")
+                    origchapter = get_meta_content('chapterorigtitle',header)
+                    tocchapter = get_meta_content('chaptertoctitle',header)
+                    chapter = get_meta_content('chaptertitle',header)
+                    do_unnew = chapter and origchapter and origchapter != chapter
+                    # logger.debug("chapter:(%s) origchapter:(%s)"%(chapter, origchapter))
 
-                if not (chapterorigtitle and chaptertoctitle and chaptertitle \
-                            and chapterorigtitle == chaptertitle):
+                if do_unnew:
+                    # logger.debug("doing unnew")
                     # should be re-reading an FFF file, single soup should
                     # be good enough and halve processing time.
                     soup = make_soup(data,dblsoup=False)
 
-                    chapterorigtitle = None
-                    tag = soup.find('meta',{'name':'chapterorigtitle'})
-                    if tag:
-                        chapterorigtitle = tag['content']
-
-                    # toctitle is separate for add_chapter_numbers:toconly users.
-                    chaptertoctitle = None
-                    tag = soup.find('meta',{'name':'chaptertoctitle'})
-                    if tag:
-                        chaptertoctitle = tag['content']
-                    else:
-                        chaptertoctitle = chapterorigtitle
-
-                    chaptertitle = None
-                    tag = soup.find('meta',{'name':'chaptertitle'})
-                    if tag:
-                        chaptertitle = tag['content']
-                        chaptertitle_tag = tag
-
-                #logger.debug("chaptertitle:(%s) chapterorigtitle:(%s)"%(chaptertitle, chapterorigtitle))
-                if chaptertitle and chapterorigtitle and chapterorigtitle != chaptertitle:
                     origdata = data
-                    # data = data.replace(u'<meta name="chaptertitle" content="'+chaptertitle+u'"></meta>',
-                    #                     u'<meta name="chaptertitle" content="'+chapterorigtitle+u'"></meta>')
-                    # data = data.replace(u'<title>'+chaptertitle+u'</title>',u'<title>'+chapterorigtitle+u'</title>')
-                    # data = data.replace(u'<h3>'+chaptertitle+u'</h3>',u'<h3>'+chapterorigtitle+u'</h3>')
-                    chaptertitle_tag['content'] = chapterorigtitle
-                    title_tag = soup.find('title')
-                    if title_tag and title_tag.string == chaptertitle:
-                        title_tag.string.replace_with(chapterorigtitle)
 
-                    h3_tag = soup.find('h3')
-                    if h3_tag and h3_tag.string == chaptertitle:
-                        h3_tag.string.replace_with(chapterorigtitle)
+                    ## new json metadata:
+                    fff_chapter_data_tag = soup.find('meta',{'name':'fff_chapter_data'})
+                    if fff_chapter_data_tag:
+                        fff_chapter_data['title'] = fff_chapter_data['chapter'] = origchapter
+                        fff_chapter_data['mark_new'] = False
+                        fff_chapter_data_tag['content'] = json.dumps(fff_chapter_data)
+
+                    ## for old chaptertitle tag.
+                    chaptertitle_meta_tag = soup.find('meta',{'name':'chaptertitle'})
+                    if chaptertitle_meta_tag:
+                        chaptertitle_meta_tag['content'] = origchapter
+
+                    title_tag = soup.find('title')
+                    if title_tag and title_tag.string == chapter:
+                        title_tag.string.replace_with(origchapter)
+
+                    # by default, chapter title will have
+                    # class=fff_chapter_title, regardless of tag.
+                    hx = soup.select_one('body .fff_chapter_title')
+                    if not hx:
+                        # if old enough to not have
+                        # .fff_chapter_title, look for first h2/h3.
+                        # ffdl/fff epubs usually have chapter title h3
+                        # but h2 works on update, so some user may
+                        # have used it.
+                        hx = soup.select_one('body > h2, h3')
+                    ## changed from exact match in case of extra
+                    ## whitespace, or markers in the title tag.
+                    if hx and chapter in hx.string:
+                        unnew_title = hx.string.replace(chapter,origchapter)
+                        hx.string.replace_with(unnew_title)
 
                     data = str(soup)
 
@@ -554,9 +594,9 @@ def reset_orig_chapters_epub(inputio,outfile):
 
                     if entrychanged:
                         # logger.debug("\nentrychanged:%s\n"%zf)
-                        _replace_tocncx(tocncxdom,zf,chaptertoctitle)
+                        _replace_tocncx(tocncxdom,zf,tocchapter)
                         if navxhtmldom:
-                            _replace_navxhtml(navxhtmldom,zf,chaptertoctitle)
+                            _replace_navxhtml(navxhtmldom,zf,tocchapter)
                         ## Also look for and update individual
                         ## book toc.ncx files for anthology in case
                         ## it's unmerged.
@@ -564,9 +604,9 @@ def reset_orig_chapters_epub(inputio,outfile):
                         mergedprefix_len = len(zf[:zf.rfind('/OEBPS/')])+1
 
                         if zf_toc in unmerge_tocncxdoms:
-                            _replace_tocncx(unmerge_tocncxdoms[zf_toc],zf[mergedprefix_len:],chaptertoctitle)
+                            _replace_tocncx(unmerge_tocncxdoms[zf_toc],zf[mergedprefix_len:],tocchapter)
                         if zf_toc in unmerge_navxhtmldoms:
-                            _replace_navxhtml(unmerge_navxhtmldoms[zf_toc],zf[mergedprefix_len:],chaptertoctitle)
+                            _replace_navxhtml(unmerge_navxhtmldoms[zf_toc],zf[mergedprefix_len:],tocchapter)
 
                 outputepub.writestr(zf,data.encode('utf-8'))
             else:
@@ -600,7 +640,7 @@ def reset_orig_chapters_epub(inputio,outfile):
 
     return changed
 
-def _replace_tocncx(tocncxdom,zf,chaptertoctitle):
+def _replace_tocncx(tocncxdom,zf,tocchapter):
     ## go after the TOC entry, too.
     # <navPoint id="file0005" playOrder="6">
     #   <navLabel>
@@ -611,16 +651,16 @@ def _replace_tocncx(tocncxdom,zf,chaptertoctitle):
     for contenttag in tocncxdom.getElementsByTagName("content"):
         if contenttag.getAttribute('src') == zf:
             texttag = contenttag.parentNode.getElementsByTagName('navLabel')[0].getElementsByTagName('text')[0]
-            texttag.childNodes[0].replaceWholeText(chaptertoctitle)
+            texttag.childNodes[0].replaceWholeText(tocchapter)
             #logger.debug("text label:%s"%texttag.toxml())
             continue
 
-def _replace_navxhtml(navxhtmldom,zf,chaptertoctitle):
+def _replace_navxhtml(navxhtmldom,zf,tocchapter):
     ## go after the TOC entry, too.
     # <li><a href="OEBPS/file0003.xhtml">3. (new) Chapter 2, Sinmay on Kintikin</a></li>
     for atag in navxhtmldom.getElementsByTagName("a"):
         if atag.getAttribute('href') == zf:
-            atag.childNodes[0].replaceWholeText(chaptertoctitle)
+            atag.childNodes[0].replaceWholeText(tocchapter)
             # logger.debug("a href=%s label:%s"%(zf,atag.toxml()))
             continue
 

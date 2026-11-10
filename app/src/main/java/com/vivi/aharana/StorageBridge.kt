@@ -126,7 +126,9 @@ object StorageBridge {
         val fileName = queryDisplayName(resolver, uri) ?: "imported_${System.currentTimeMillis()}.epub"
         val tempFile = File(context.filesDir, "tmp_${System.currentTimeMillis()}_$fileName")
         return try {
-            resolver.openInputStream(uri)?.use { input ->
+            val stream = resolver.openInputStream(uri)
+                ?: throw IOException("Document provider returned no input stream")
+            stream.use { input ->
                 tempFile.outputStream().use { output ->
                     input.copyTo(output)
                 }
@@ -134,6 +136,8 @@ object StorageBridge {
             tempFile
         } catch (e: Exception) {
             tempFile.delete()
+            DiagnosticLog.appendException(context, "StorageBridge",
+                "epub_document_open_failed source=${uri.toString().take(512)}", e)
             null
         }
     }

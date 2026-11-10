@@ -3,11 +3,13 @@ package com.vivi.aharana
 import android.os.Bundle
 import android.widget.LinearLayout
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.lifecycle.lifecycleScope
 import com.vivi.aharana.adapter.DownloadJobAdapter
 import com.vivi.aharana.data.local.AppDatabase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class DownloadQueueActivity : BaseActivity() {
 
@@ -29,31 +31,45 @@ class DownloadQueueActivity : BaseActivity() {
         adapter = DownloadJobAdapter(
             onRetry = { job ->
                 DiagnosticLog.append(this, "Queue.Retry", "jobId=${job.id} type=${job.type}")
-                val repo = BookRepository(this)
+                val repo = BookRepository.getInstance(this)
                 CoroutineScope(Dispatchers.Main).launch {
-                    // Retry resolves to an update when the story is already in the
-                    // library, so the toast has to say which one it did.
-                    val action = repo.retryJob(job)
-                    showMessage(
-                        if (action == "update") R.string.retry_update_toast else R.string.retry_failed_toast
-                    )
-                    // Mark the old job as cancelled so it disappears from the queue
-                    // and the retried job appears as a new entry
-                    repo.cancelJob(job)
+                    try {
+                        val action = repo.retryJob(job)
+                        if (action == "none") {
+                            showMessage("Unable to retry: this request has no usable input or is no longer retryable.")
+                        } else {
+                            showMessage(if (action == "update") R.string.retry_update_toast else R.string.retry_failed_toast)
+                        }
+                    } catch (e: Exception) {
+                        DiagnosticLog.append(this@DownloadQueueActivity, "Queue.Retry",
+                            "submission_failed job_id=${job.id} error_class=${e.javaClass.simpleName}")
+                        showMessage("Retry could not be queued. The original request was kept.")
+                    }
                 }
             },
             onCancel = { job ->
                 DiagnosticLog.append(this, "Queue.Cancel", "button jobId=${job.id} type=${job.type}")
-                BookRepository(this).cancelJob(job)
+                BookRepository.getInstance(this).cancelJob(job)
                 showMessage(R.string.queue_cancelled_toast)
             },
             onRemove = { job ->
                 DiagnosticLog.append(this, "Queue.Remove", "jobId=${job.id}")
                 val db = AppDatabase.getInstance(this)
-                CoroutineScope(Dispatchers.IO).launch {
-                    db.downloadJobDao().delete(job)
+                lifecycleScope.launch {
+                    try {
+                        val removed = withContext(Dispatchers.IO) {
+                            db.downloadJobDao().removeFinished(job.id, job.workId, job.status)
+                        }
+                        if (removed > 0) showMessage(R.string.queue_removed_toast)
+                        else showMessage("This request changed. Its current queue entry was kept.")
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        DiagnosticLog.append(this@DownloadQueueActivity, "Queue.Remove",
+                            "remove_failed job_id=${job.id} error_class=${e.javaClass.simpleName}")
+                        showMessage("Could not remove this request. Please try again.")
+                    }
                 }
-                showMessage(R.string.queue_removed_toast)
             }
         )
 
@@ -62,12 +78,12 @@ class DownloadQueueActivity : BaseActivity() {
 
         val db = AppDatabase.getInstance(this)
         db.downloadJobDao().observeAll().observe(this) { allJobs ->
-            // Show download/update/force_download jobs that are not yet successful.
+            // Keep successful partial downloads visible until explicitly removed.
             // Metadata-fetch jobs (type == "metadata") are internal background lookups
             // and should NOT appear in the download queue — they are tracked
             // separately in AddFromPageActivity via observer callbacks.
             val visible = allJobs
-                .filter { it.type != "metadata" && it.status != "success" && it.status != "cancelled" }
+                .filter { DownloadWarnings.showInQueue(it.type, it.status, it.resultJson) }
                 .sortedByDescending { it.createdAt }
             adapter.submitList(visible.toList())
             if (visible.isEmpty()) {

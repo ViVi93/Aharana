@@ -16,7 +16,7 @@
 #
 
 import contextlib
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import re
 import json
@@ -59,6 +59,15 @@ class RoyalRoadAdapter(BaseSiteAdapter):
 
         # RR has globally unique ID for each chapter which can be used for fast lookup
         self.chapterURLIndex = {}
+
+    @staticmethod
+    def parse_datetime(value):
+        # Treat RR ISO timestamps without an offset as UTC. Normalize both
+        # chapters and JSON-LD metadata before comparing; never use host local time.
+        date = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return date.astimezone(timezone.utc)
 
     def make_date(self, parenttag):
         # locale dates differ but the timestamp is easily converted
@@ -152,7 +161,7 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         if match and ((match.group(1) and match.group(3)) or (not match.group(1) and not match.group(3))):
             chapter_url_index = self.chapterURLIndex.get(match.group(2))
             if chapter_url_index is not None:
-                return self.chapterUrls[chapter_url_index]['url']
+                return self.get_chapter(chapter_url_index,'url')
         return url
 
 
@@ -231,25 +240,34 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # "url":"/fiction/41656/chaotic-craftsman-worships-the-cube/chapter/654078/ch1-prologue"}, ...
         chapters_js = re.search(r'^ *window.chapters *= *(.*) *; *$',data,flags=re.MULTILINE)
         # logger.debug(chapters_js)
+        last_chapter_date = None
         if chapters_js:
             chapters_info = json.loads(chapters_js.group(1))
             # logger.debug(json.dumps(chapters_info, sort_keys=True,
             #                         indent=2, separators=(',', ':')))
             for chap in chapters_info:
-                if chap['isUnlocked']: # locked chapters are not downloadable.
+                # isUnlocked isn't accurate; only chapters without subscription tiers are public.
+                if not chap['subscriptionTiers']:
                     chapterUrl = 'https://' + self.getSiteDomain() + chap['url']
-                    chapterDate = datetime.fromisoformat(chap['date'])
+                    chapterDate = self.parse_datetime(chap['date'])
+                    if last_chapter_date is None or chapterDate > last_chapter_date:
+                        last_chapter_date = chapterDate
                     date_format = self.getConfig("datechapter_format", self.getConfig("datePublished_format", self.dateformat))
                     if self.add_chapter(chap['title'], chapterUrl, {'date': chapterDate.strftime(date_format)}):
                     ## str to match lookup.
-                        self.chapterURLIndex[str(chap['id'])] = len(self.chapterUrls) - 1
+                        self.chapterURLIndex[str(chap['id'])] = self.num_chapters() - 1
         if self.num_chapters() < 1:
             raise exceptions.FailedToDownload("Story has no chapters: %s" % url)
 
         self.setDescription(url,story_json['description'])
 
-        self.story.setMetadata('dateUpdated', datetime.fromisoformat(story_json['dateModified']))
-        self.story.setMetadata('datePublished', datetime.fromisoformat(story_json['datePublished']))
+        dateUpdated = self.parse_datetime(story_json['dateModified'])
+        # JSON-LD dateModified can be stale even with newer public chapters.
+        if last_chapter_date is not None:
+            if last_chapter_date > dateUpdated:
+                dateUpdated = last_chapter_date
+        self.story.setMetadata('dateUpdated', dateUpdated)
+        self.story.setMetadata('datePublished', self.parse_datetime(story_json['datePublished']))
 
         for a in soup.select('div#chapterHeroData a[href^="/fictions/search?tagsAdd="]'):
             genre = stripHTML(a)
@@ -339,24 +357,32 @@ class RoyalRoadAdapter(BaseSiteAdapter):
         # "url":"/fiction/41656/chaotic-craftsman-worships-the-cube/chapter/654078/ch1-prologue"}, ...
         chapters_js = re.search(r'^ *window.chapters *= *(.*) *; *$',data,flags=re.MULTILINE)
         # logger.debug(chapters_js)
+        first_chapter_date = None
+        last_chapter_date = None
         if chapters_js:
             chapters_info = json.loads(chapters_js.group(1))
             # logger.debug(json.dumps(chapters_info, sort_keys=True,
             #                         indent=2, separators=(',', ':')))
             for chap in chapters_info:
-                if chap['isUnlocked']: # locked chapters are not downloadable.
+                # isUnlocked isn't accurate; only chapters without subscription tiers are public.
+                if not chap['subscriptionTiers']:
                     chapterUrl = 'https://' + self.getSiteDomain() + chap['url']
-                    chapterDate = datetime.fromisoformat(chap['date'])
+                    chapterDate = self.parse_datetime(chap['date'])
+                    if first_chapter_date is None or chapterDate < first_chapter_date:
+                        first_chapter_date = chapterDate
+                    if last_chapter_date is None or chapterDate > last_chapter_date:
+                        last_chapter_date = chapterDate
                     date_format = self.getConfig("datechapter_format", self.getConfig("datePublished_format", self.dateformat))
                     if self.add_chapter(chap['title'], chapterUrl, {'date': chapterDate.strftime(date_format)}):
                     ## str to match lookup.
-                        self.chapterURLIndex[str(chap['id'])] = len(self.chapterUrls) - 1
+                        self.chapterURLIndex[str(chap['id'])] = self.num_chapters() - 1
 
-        description = soup.select_one('div.description div.hidden-content')
+        description = soup.select_one('div.description div')
         self.setDescription(url,description)
 
-        self.story.setMetadata('dateUpdated', self.make_date(tds[-1][1]))
-        self.story.setMetadata('datePublished', self.make_date(tds[0][1]))
+        # The visible table can be paginated or differently ordered.
+        self.story.setMetadata('dateUpdated', last_chapter_date)
+        self.story.setMetadata('datePublished', first_chapter_date)
 
         for a in soup.find_all('a',{'class':'fiction-tag'}): # not all stories have genre
             genre = stripHTML(a)

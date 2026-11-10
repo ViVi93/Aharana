@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 from urllib.parse import quote_plus
 from http.cookiejar import LWPCookieJar, MozillaCookieJar
 from ..ensure import ensure_binary
+from .. import diagnostics
 
 class FetcherResponse(object):
     def __init__(self,content,redirecturl=None,fromcache=False,json=None):
@@ -96,6 +97,7 @@ class Fetcher(object):
         '''Returns a FetcherResponse regardless of mechanism'''
         raise NotImplementedError()
 
+    @diagnostics.request_call
     def do_request(self, method, url,
                     parameters=None,
                     referer=None,

@@ -64,13 +64,15 @@ class OrganisationUiTests(unittest.TestCase):
         self.assertIn('suspend fun reconcileOrganisedPaths', source)
         body = source.split('suspend fun reconcileOrganisedPaths', 1)[1].split('private const val BULK_METADATA_TAG', 1)[0]
         self.assertIn('database.withTransaction', body)
-        self.assertIn('bookDao.update(', body)
-        self.assertIn('sourcePath =', body)
-        self.assertIn('inputPath =', body)
-        self.assertIn('outputPath =', body)
+        self.assertIn('bookDao.updatePaths(book.id, path, source)', body)
+        self.assertIn('remapOrganisedPaths(book.filePath, book.sourcePath, moves)', body)
+        self.assertIn('val input = job.inputPath?.let { moves[it] ?: it }', body)
+        self.assertIn('val output = job.outputPath?.let { moves[it] ?: it }', body)
+        self.assertIn('jobDao.updatePaths(job.id, job.workId, input, output)', body)
+        self.assertNotIn('jobDao.update(job.copy(', body)
         self.assertNotIn('clear()', body)
         self.assertNotIn('insertAll(', body)
-        self.assertLess(body.index('bookDao.update('), body.index('check(recovery.optBoolean("ok"))'),
+        self.assertLess(body.index('bookDao.updatePaths('), body.index('check(recovery.optBoolean("ok"))'),
                         'Completed moves must reconnect even when another interrupted copy needs attention')
         self.assertIn('reconcileOrganisedPaths(context)', source.split('init {', 1)[1])
 

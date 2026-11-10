@@ -23,14 +23,19 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
     private var scan: Job? = null
 
     fun show(force: Boolean = false) {
-        if (model.filterIndexReady() && !force) { categories(); return }
-        val message = TextView(activity).apply { setPadding(32, 24, 32, 24); text = "Loading saved filter index…" }
+        if (!model.isRestoringLibrary() && !force) { categories(); return }
+        val message = TextView(activity).apply {
+            setPadding(32, 24, 32, 24)
+            text = if (force) "Refreshing filter data…" else "Loading saved filter data…"
+        }
         val progress = MaterialAlertDialogBuilder(activity).setTitle("Library filters")
             .setView(message).setNegativeButton("Cancel") { _, _ ->
                 scan?.cancel()
             }.create()
         progress.setOnCancelListener { scan?.cancel() }
-        val observer = Observer<String> { message.text = it.ifBlank { "Preparing filters…" } }
+        val observer = Observer<String> {
+            message.text = it.ifBlank { if (force) "Refreshing filter data…" else "Loading saved filter data…" }
+        }
         model.filterProgress.observe(activity, observer)
         progress.setOnDismissListener { model.filterProgress.removeObserver(observer) }
         progress.show()
@@ -42,10 +47,12 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
             } catch (cancelled: CancellationException) {
                 progress.dismiss()
                 throw cancelled
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 progress.dismiss()
+                DiagnosticLog.appendException(activity, "LibraryFilters", "filter_refresh_failed", e)
+                if (activity.isFinishing || activity.isDestroyed) return@launch
                 MaterialAlertDialogBuilder(activity).setTitle("Filters unavailable")
-                    .setMessage("Saved metadata could not be indexed. Your current filters and books were not changed.")
+                    .setMessage("Filter data could not be refreshed. Cached filter data and your current choices were kept. Choose Refresh filter data to retry; clear filters to show all books.")
                     .setPositiveButton("Close", null).show()
             }
         }
@@ -57,11 +64,15 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
             draftInitialized = true
         }
         val content = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 0, 24, 8) }
-        content.addView(TextView(activity).apply {
-            text = "Choose multiple values in each category. Values in the same category match ANY; categories combine with AND. Counts use the full library. Search and sort still apply.\n" +
-                "Applied selections persist across app restarts. Saved metadata is cached; only new/changed books need EPUB reads." +
-                if (model.filterReadFailures > 0) "\n${model.filterReadFailures} books unreadable; marked separately, not missing metadata." else ""
-        })
+        val explanation = TextView(activity)
+        fun explain() {
+            explanation.text = "Choose multiple values in each category. Values in the same category match ANY; categories combine with AND. Counts use cached filter data for books still in the library. Search and sort still apply.\n" +
+                "Applied selections persist across app restarts. Filter data is not checked automatically: startup, downloads, opening filters and Apply never scan EPUBs. Refresh filter data rereads all books, including new/changed data and external edits.\n" +
+                model.filterDataStatus() +
+                if (model.filterReadFailures > 0) "\n" + model.filterReadFailureSummary() else ""
+        }
+        explain()
+        content.addView(explanation)
         val dialog = MaterialAlertDialogBuilder(activity).setTitle("Library filters")
             .setView(ScrollView(activity).apply { addView(content) })
             .setPositiveButton("Apply") { _, _ -> model.setLibraryFilters(selection.mapValues { it.value.toSet() }) }
@@ -75,9 +86,12 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
             })
         }
         content.addView(MaterialButton(activity).apply {
-            text = "Rebuild metadata cache (read all EPUBs)"
+            text = "Refresh filter data"
             setOnClickListener { dialog.dismiss(); show(force = true) }
         })
+        val observer = Observer<Int> { explain() }
+        model.filterDataUpdates.observe(activity, observer)
+        dialog.setOnDismissListener { model.filterDataUpdates.removeObserver(observer) }
         dialog.show()
     }
 
@@ -86,11 +100,11 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
         val content = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 0, 24, 0) }
         val search = EditText(activity).apply { hint = "Search values"; isSingleLine = true }
         val list = ListView(activity).apply { choiceMode = ListView.CHOICE_MODE_MULTIPLE }
-        val all = model.filterOptions(key).toMutableMap()
-        // Preserve chosen values even if a new index no longer has matching books.
-        selected.forEach { all.putIfAbsent(it, 0) }
         var displayed = emptyList<String>()
         fun render() {
+            val all = model.filterOptions(key).toMutableMap()
+            // Selected zero-count choices remain clearable, but deleted-only unselected options disappear.
+            selected.forEach { all.putIfAbsent(it, 0) }
             val query = search.text.toString().trim()
             displayed = all.keys.filter { it.contains(query, ignoreCase = true) }
             list.adapter = ArrayAdapter(activity, android.R.layout.simple_list_item_multiple_choice,
@@ -112,6 +126,9 @@ internal class LibraryFilterDialog(private val activity: AppCompatActivity, priv
             .setNegativeButton("Back") { _, _ -> categories() }
             .setNeutralButton("Clear category") { _, _ -> selection.remove(key); categories() }.create()
         dialog.setOnCancelListener { categories() }
+        val observer = Observer<Int> { render() }
+        model.filterDataUpdates.observe(activity, observer)
+        dialog.setOnDismissListener { model.filterDataUpdates.removeObserver(observer) }
         dialog.show()
     }
 }

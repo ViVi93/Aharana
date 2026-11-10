@@ -5,6 +5,13 @@ import android.content.Context
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import androidx.room.withTransaction
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.Data
@@ -78,7 +85,7 @@ class FanFicFareWorker(
     }
 
     private suspend fun updateJobStatus(jobDao: DownloadJobDao, job: DownloadJobEntity, status: String) {
-        jobDao.update(job.copy(status = status))
+        jobDao.updateFromWorker(job.copy(status = status))
         logWorker("doWork", "db_status jobId=${job.id} status=$status")
     }
 
@@ -97,50 +104,46 @@ class FanFicFareWorker(
         else -> status.replaceFirstChar { it.uppercase() }
     }
 
-    private fun logWorker(tag: String, message: String) {
-        val text = "[$tag] $message"
-        android.util.Log.d("FFF-Worker", text)
-        try {
-            DiagnosticLog.append(applicationContext, "FFF-Worker", text)
-        } catch (e: Exception) {
-            android.util.Log.e("FFF-Worker", "log_failed", e)
+    private var diagnosticJobId: Long = 0
+    @Volatile private var workerStage = "entry"
+
+    private fun stopReasonLabel(): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) stopReason.toString() else "unavailable_before_api31"
+
+    private suspend fun ensureWorkerActive(stage: String) {
+        workerStage = stage
+        currentCoroutineContext().ensureActive()
+        if (isStopped) throw CancellationException("worker_stopped")
+        if (diagnosticJobId > 0) {
+            val current = AppDatabase.getInstance(applicationContext).downloadJobDao().getById(diagnosticJobId)
+            if (current == null || current.workId != inputData.getString(KEY_WORK_ID) ||
+                current.status in setOf("cancelled", "superseded")) {
+                throw CancellationException("job_no_longer_active")
+            }
         }
     }
 
-    /**
-     * Terminal state for a job whose worker was stopped before it did any work.
-     *
-     * Returning Result.failure() on its own left the Room row at "queued"/"waiting"
-     * forever: WorkManager considers the work finished, so nothing will ever run it
-     * again, while the row still claims to be in flight - which is how downloads
-     * piled up in the queue with no Retry button and nothing to identify them.
-     * Cancelled rows are left alone; anything else becomes failed (retryable), or
-     * success when a usable EPUB is already on disk.
-     */
-    private suspend fun markInterruptedJob(workId: String) {
-        if (workId.isBlank()) return
+    private fun logWorker(tag: String, message: String) {
+        val text = DiagnosticFiles.sanitize("event=$tag job_id=$diagnosticJobId work_name=${inputData.getString(KEY_WORK_ID)} " +
+            "request_id=$id run_attempt=$runAttemptCount operation=${inputData.getString(KEY_TYPE)} " +
+            "stage=$workerStage is_stopped=$isStopped stop_reason=${stopReasonLabel()} $message")
+            .replace("\n", " ").replace("\r", " ").take(2048)
+        android.util.Log.d("FFF-Worker", text)
         try {
-            val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
-            val job = dao.findByWorkId(workId) ?: return
-            if (job.status == "success" || job.status == "cancelled") return
-            val output = job.outputPath?.ifBlank { null }
-            val file = output?.let { File(it) }
-            if (file != null && file.exists() && file.isFile && file.length() > 0) {
-                dao.update(job.copy(status = "success", finishedAt = System.currentTimeMillis()))
-                logWorker("doWork", "stopped_marked_success id=${job.id}")
-            } else {
-                dao.update(
-                    job.copy(
-                        status = "failed",
-                        error = "interrupted_worker_stopped",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                logWorker("doWork", "stopped_marked_failed id=${job.id}")
-            }
-        } catch (e: Exception) {
-            logWorker("doWork", "stopped_mark_failed=${e.message}")
+            DiagnosticLog.append(applicationContext, "FFF-Worker", text)
+        } catch (_: Exception) {
+            android.util.Log.e("FFF-Worker", "log_failed")
         }
+    }
+
+    /** Does not inspect files: cancellation can occur before storage exclusion is acquired. */
+    private suspend fun markInterruptedJob(workId: String, reason: String) {
+        if (workId.isBlank()) return
+        val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
+        val current = dao.findByWorkId(workId) ?: return
+        val changed = dao.updateFromWorker(current.copy(status = "failed", error = reason,
+            finishedAt = System.currentTimeMillis()))
+        logWorker("interruption_persisted", "updated=$changed current_status=${current.status}")
     }
 
     private suspend fun upsertBook(
@@ -168,6 +171,29 @@ class FanFicFareWorker(
         }
     }
 
+    /** Room serializes explicit Cancel with library+success commit; no stale worker book write. */
+    private suspend fun completeBook(
+        bookDao: BookDao,
+        jobDao: DownloadJobDao,
+        candidate: BookEntity,
+        path: String,
+        completed: DownloadJobEntity
+    ): Boolean {
+        val database = AppDatabase.getInstance(applicationContext)
+        return database.withTransaction {
+            ensureWorkerActive("commit_book")
+            if (!QueueJobPolicy.canWorkerWrite(jobDao.getById(completed.id)?.status)) return@withTransaction false
+            val saved = upsertBook(bookDao, candidate, path)
+            ensureWorkerActive("commit_book_result")
+            if (!jobDao.updateFromWorker(completed.copy(bookId = saved.id))) {
+                // Throw so the book upsert rolls back too, including if a row was removed.
+                throw CancellationException("job_no_longer_active")
+            }
+            logWorker("book_committed", "book_id=${saved.id}")
+            true
+        }
+    }
+
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
             .setContentTitle("FanFicFare")
@@ -179,214 +205,122 @@ class FanFicFareWorker(
     }
 
     override suspend fun doWork(): Result {
-        // Foreground promotion must precede a possibly long wait for an organiser transaction.
-        setForeground(getForegroundInfo())
-        if (inputData.getString(KEY_TYPE) == TYPE_METADATA) return doWorkUnlocked()
+        val started = SystemClock.elapsedRealtime()
+        val workName = inputData.getString(KEY_WORK_ID).orEmpty()
+        logWorker("doWork", "ENTER") // Even foreground/storage wait failures need an entry.
         return try {
-            LibraryStorageGate.run {
-                BookRepository.reconcileOrganisedPaths(applicationContext)
+            diagnosticJobId = AppDatabase.getInstance(applicationContext).downloadJobDao()
+                .findByWorkId(workName)?.id ?: 0
+            workerStage = "foreground"
+            setForeground(getForegroundInfo())
+            ensureWorkerActive("before_storage")
+            if (inputData.getString(KEY_TYPE) == TYPE_METADATA) {
                 doWorkUnlocked()
-            }
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                // Cancellation can happen BEFORE acquiring storage exclusion: update only the
-                // job row here, never inspect an output file while the organiser may move it.
-                val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
-                dao.findByWorkId(inputData.getString(KEY_WORK_ID).orEmpty())?.let { job ->
-                    if (job.status != "success" && job.status != "cancelled") {
-                        dao.update(job.copy(status = "cancelled", finishedAt = System.currentTimeMillis()))
+            } else {
+                workerStage = "storage_wait"
+                val waitingAt = SystemClock.elapsedRealtime()
+                logWorker("storage_wait", "wait_started")
+                try {
+                    LibraryStorageGate.run {
+                        val acquiredAt = SystemClock.elapsedRealtime()
+                        logWorker("storage_acquired", "wait_ms=${acquiredAt - waitingAt}")
+                        try {
+                            ensureWorkerActive("storage_recovery")
+                            BookRepository.reconcileOrganisedPaths(applicationContext)
+                            doWorkUnlocked()
+                        } finally {
+                            logWorker("storage_released", "held_ms=${SystemClock.elapsedRealtime() - acquiredAt}")
+                        }
                     }
+                } finally {
+                    logWorker("storage_wait_finished", "elapsed_ms=${SystemClock.elapsedRealtime() - waitingAt}")
                 }
             }
+        } catch (e: CancellationException) {
+            logWorker("cancellation", "error_class=${e.javaClass.simpleName}")
+            withContext(NonCancellable) {
+                try {
+                    markInterruptedJob(workName, QueueJobPolicy.interruptionReason(workerStage, stopReasonLabel()))
+                } catch (persistError: Exception) {
+                    logWorker("interruption_persist_failed", "error_class=${persistError.javaClass.simpleName}")
+                }
+            }
+            // WorkManager owns scheduler resumption. Never return failure or persist user
+            // cancellation merely because its coroutine/constraints were stopped.
             throw e
         } catch (e: Exception) {
-            logWorker("doWork", "storage_recovery_failed=${e.message}")
-            val dao = AppDatabase.getInstance(applicationContext).downloadJobDao()
-            dao.findByWorkId(inputData.getString(KEY_WORK_ID).orEmpty())?.let { job ->
-                if (job.status != "cancelled") dao.update(job.copy(status = "failed", error = e.message,
-                    finishedAt = System.currentTimeMillis()))
-            }
+            logWorker("failure", "error_class=${e.javaClass.simpleName}")
+            markInterruptedJob(workName, "Worker failed at $workerStage (${e.javaClass.simpleName}). Retry to resume.")
             setPhase("failed")
             Result.failure()
+        } finally {
+            logWorker("exit", "elapsed_ms=${SystemClock.elapsedRealtime() - started}")
         }
     }
 
     private suspend fun doWorkUnlocked(): Result {
-        logWorker("doWork", "ENTER url=${inputData.getString(KEY_URL)} type=${inputData.getString(KEY_TYPE)} workId=${inputData.getString(KEY_WORK_ID)}")
-        val type = inputData.getString(KEY_TYPE) ?: return Result.failure().also { logWorker("doWork", "no_type") }
-        val url = inputData.getString(KEY_URL) ?: ""
-        val inputPath = inputData.getString(KEY_INPUT_PATH) ?: ""
+        ensureWorkerActive("initialise")
+        val type = inputData.getString(KEY_TYPE) ?: error("Missing operation type")
+        val url = inputData.getString(KEY_URL).orEmpty()
+        val inputPath = inputData.getString(KEY_INPUT_PATH).orEmpty()
         val bookId = inputData.getLong(KEY_BOOK_ID, -1L)
-        val workId = inputData.getString(KEY_WORK_ID) ?: ""
-        logWorker("doWork", "start type=$type url=$url workId=$workId")
-
-        if (isStopped) {
-            logWorker("doWork", "stopped_early")
-            markInterruptedJob(workId)
-            return Result.failure()
-        }
-
-        if (isStopped) {
-            logWorker("doWork", "stopped_early")
-            markInterruptedJob(workId)
-            return Result.failure()
-        }
-
-        try {
-            if (!com.chaquo.python.Python.isStarted()) {
+        val workId = inputData.getString(KEY_WORK_ID).orEmpty()
+        if (!com.chaquo.python.Python.isStarted()) {
+            try {
                 com.chaquo.python.Python.start(com.chaquo.python.android.AndroidPlatform(applicationContext))
-                logWorker("doWork", "python_started")
+                logWorker("python_started", "ready")
+            } catch (e: Exception) {
+                if (!com.chaquo.python.Python.isStarted()) throw e
+                logWorker("python_start_raced", "already_started error_class=${e.javaClass.simpleName}")
             }
-        } catch (e: Exception) {
-            logWorker("doWork", "python_start_failed=${e.message}")
         }
-
         val database = AppDatabase.getInstance(applicationContext)
         val bookDao = database.bookDao()
         val jobDao = database.downloadJobDao()
-
-        val existingJob = if (workId.isNotBlank()) jobDao.findByWorkId(workId) else null
-        val recovery = when {
-            existingJob == null -> null.also { logWorker("doWork", "no_existing_job") }
-            existingJob.status == "success" -> recoverExistingSuccess(type, existingJob, bookDao, jobDao).also { logWorker("doWork", "recovered_success") }
-            existingJob.status == "cancelled" -> Result.failure().also { logWorker("doWork", "existing_cancelled") }
-            else -> null.also { logWorker("doWork", "existing_status=${existingJob.status}") }
-        }
-        if (recovery != null) return recovery
-
-        // CRITICAL: Update the existing job (found by workId) rather than inserting
-        // a new one.  The original enqueueDownload/enqueueMetadata/etc. already
-        // created a job row with status="queued".  If we insert a NEW row here,
-        // the original row stays stuck at "queued" forever and shows up in the
-        // Download Queue even after the download completes successfully.
-        var job: DownloadJobEntity
-        var jobId: Long
-        if (existingJob != null) {
-            // Do NOT flip to "running" here: the engine gate below may keep this job
-            // waiting behind another download, and the queue UI must say so.
-            job = existingJob.copy(status = STATUS_WAITING)
-            jobDao.update(job)
-            jobId = existingJob.id
-            logWorker("doWork", "awaiting_gate id=$jobId")
-        } else {
-            job = DownloadJobEntity(
-                bookId = bookId,
-                type = type,
-                status = STATUS_WAITING,
-                inputUrl = url.ifBlank { null },
-                inputPath = inputPath.ifBlank { null },
-                createdAt = System.currentTimeMillis()
-            )
-            jobId = jobDao.insert(job)
-            logWorker("doWork", "job_inserted id=$jobId")
-        }
-
-        return try {
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        id = jobId,
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                logWorker("doWork", "stopped_before_phase")
-                return Result.failure()
+        val existing = workId.takeIf { it.isNotBlank() }?.let { jobDao.findByWorkId(it) }
+        if (existing == null && workId.isNotBlank()) return Result.failure()
+        if (existing?.status == "success") return recoverExistingSuccess(type, existing, bookDao, jobDao)
+        if (existing?.status in setOf("cancelled", "superseded")) return Result.failure()
+        val job = if (existing != null) {
+            existing.copy(status = STATUS_WAITING, error = null, finishedAt = null).also {
+                if (!jobDao.updateFromWorker(it)) throw CancellationException("job_no_longer_active")
             }
-
-            setPhase("waiting")
-            logWorker("doWork", "phase=waiting type=$type")
-
-            // Only one FanFicFare engine call runs at a time. Sharing several URLs
-            // used to run them in parallel, which tripped the host's rate limiter
-            // (503 for every job in the burst). Metadata lookups are background
-            // work and must not queue in front of anything the user asked for.
+        } else {
+            val pending = DownloadJobEntity(bookId = bookId, type = type, status = STATUS_WAITING,
+                inputUrl = url.ifBlank { null }, inputPath = inputPath.ifBlank { null },
+                workId = workId.ifBlank { null }, createdAt = System.currentTimeMillis())
+            pending.copy(id = jobDao.insert(pending))
+        }
+        diagnosticJobId = job.id
+        ensureWorkerActive("before_engine_wait")
+        setPhase("waiting")
+        workerStage = "engine_wait"
+        val waitingAt = SystemClock.elapsedRealtime()
+        logWorker("engine_wait", "wait_started")
+        return try {
             FanFicFareGate.run(visible = type != TYPE_METADATA) {
-                if (isStopped) {
-                    jobDao.update(
-                        job.copy(
-                            id = jobId,
-                            status = "cancelled",
-                            finishedAt = System.currentTimeMillis()
-                        )
-                    )
-                    logWorker("doWork", "stopped_while_waiting")
-                    return@run Result.failure()
-                }
-
-                job = job.copy(status = "running")
-                jobDao.update(job)
-                logWorker("doWork", "gate_acquired id=$jobId")
-
-                setPhase("preparing")
-                logWorker("doWork", "phase=preparing")
-
-                // Heartbeat: the gate is one-call-at-a-time, so a call that never
-                // returns stalls the whole queue. This does not kill anything (the
-                // app deliberately has no generic timeouts) - it makes the stall
-                // visible in Diagnostics and in the foreground notification instead
-                // of looking like an idle queue.
-                withEngineHeartbeat(type) {
-                    when (type) {
-                        TYPE_DOWNLOAD -> {
-                            logWorker("doWork", "calling_handleDownload")
-                            handleDownload(url, bookDao, jobDao, job.copy(id = jobId)).also { logWorker("doWork", "handleDownload_result=$it") }
-                        }
-                        TYPE_UPDATE -> {
-                            logWorker("doWork", "calling_handleUpdate")
-                            handleUpdate(bookId, inputPath, bookDao, jobDao, job.copy(id = jobId)).also { logWorker("doWork", "handleUpdate_result=$it") }
-                        }
-                        TYPE_FORCE_DOWNLOAD -> {
-                            logWorker("doWork", "calling_handleForceDownload")
-                            handleForceDownload(bookId, inputPath, bookDao, jobDao, job.copy(id = jobId)).also { logWorker("doWork", "handleForceDownload_result=$it") }
-                        }
-                        TYPE_METADATA -> {
-                            logWorker("doWork", "calling_handleMetadata")
-                            handleMetadata(url, jobDao, job.copy(id = jobId)).also { logWorker("doWork", "handleMetadata_result=$it") }
-                        }
-                        else -> {
-                            jobDao.update(
-                                job.copy(
-                                    id = jobId,
-                                    status = "failed",
-                                    error = "Unknown type: $type",
-                                    finishedAt = System.currentTimeMillis()
-                                )
-                            )
-                            logWorker("doWork", "unknown_type")
-                            setPhase("failed")
-                            Result.failure()
+                val acquiredAt = SystemClock.elapsedRealtime()
+                logWorker("engine_acquired", "wait_ms=${acquiredAt - waitingAt}")
+                try {
+                    ensureWorkerActive("engine_acquired")
+                    val running = job.copy(status = "running")
+                    if (!jobDao.updateFromWorker(running)) throw CancellationException("job_no_longer_active")
+                    setPhase("preparing")
+                    withEngineHeartbeat(type) {
+                        when (type) {
+                            TYPE_DOWNLOAD -> handleDownload(url, bookDao, jobDao, running)
+                            TYPE_UPDATE -> handleUpdate(bookId, inputPath, bookDao, jobDao, running)
+                            TYPE_FORCE_DOWNLOAD -> handleForceDownload(bookId, inputPath, bookDao, jobDao, running)
+                            TYPE_METADATA -> handleMetadata(url, jobDao, running)
+                            else -> error("Unknown operation type")
                         }
                     }
+                } finally {
+                    logWorker("engine_released", "held_ms=${SystemClock.elapsedRealtime() - acquiredAt}")
                 }
             }
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            // Cancelled while waiting for, or using, the engine. Record it and let
-            // the cancellation propagate instead of reporting a failure.
-            jobDao.update(
-                job.copy(
-                    id = jobId,
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("cancelled")
-            logWorker("doWork", "cancelled")
-            throw e
-        } catch (e: Exception) {
-            logWorker("doWork", "exception=${e.javaClass.simpleName}: ${e.message ?: "null"}")
-            jobDao.update(
-                job.copy(
-                    id = jobId,
-                    status = "failed",
-                    error = e.message,
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("failed")
-            Result.failure()
-        }.also { result ->
-            logWorker("doWork", "final_result=$result")
+        } finally {
+            logWorker("engine_wait_finished", "elapsed_ms=${SystemClock.elapsedRealtime() - waitingAt}")
         }
     }
 
@@ -396,84 +330,14 @@ class FanFicFareWorker(
         bookDao: BookDao,
         jobDao: DownloadJobDao
     ): Result {
-        if (isStopped) {
-            return Result.failure()
-        }
-        when (type) {
-            TYPE_METADATA -> return Result.success()
-        }
-        val outputPath = existingJob.outputPath?.ifBlank { null } ?: return Result.failure()
-        // A completed job may outlive its book; never re-register a replacement at its old path.
-        if (existingJob.bookId > 0) {
-            val expected = bookDao.findById(existingJob.bookId)
-            if (expected == null || expected.filePath != outputPath) return Result.failure()
-        }
-        val file = File(outputPath)
-        val valid = file.exists() && file.isFile && file.length() > 0
-        if (!valid) return Result.failure()
-        if (isStopped) {
-            return Result.failure()
-        }
-        return when (type) {
-            TYPE_DOWNLOAD, TYPE_FORCE_DOWNLOAD -> {
-                val existing = existingJob.bookId.takeIf { it > 0 }?.let { bookDao.findById(it) }
-                val current = jobDao.getById(existingJob.id)
-                if (current?.status == "cancelled") return Result.failure()
-                if (existing == null) {
-                    val book = BookItem(
-                        title = File(outputPath).nameWithoutExtension,
-                        author = "",
-                        uriString = outputPath,
-                        lastModified = System.currentTimeMillis(),
-                        sizeBytes = file.length(),
-                        coverUriString = null,
-                        url = existingJob.inputUrl ?: "",
-                        chapters = 0,
-                        sourceUriString = outputPath
-                    ).toEntity()
-                    val before = bookDao.findByFilePath(outputPath)
-                    android.util.Log.d("FFF-Dup", "recoverDownload title=${book.title} path=${outputPath} before=${before?.id}")
-                    val saved = upsertBook(bookDao, book, outputPath)
-                    android.util.Log.d("FFF-Dup", "recoverDownload inserted id=${saved.id}")
-                    jobDao.update(
-                        existingJob.copy(
-                            bookId = saved.id,
-                            status = "success",
-                            finishedAt = System.currentTimeMillis()
-                        )
-                    )
-                } else {
-                    jobDao.update(
-                        existingJob.copy(
-                            status = "success",
-                            finishedAt = System.currentTimeMillis()
-                        )
-                    )
-                }
-                setPhase("completed", indeterminate = false)
-                Result.success()
-            }
-            TYPE_UPDATE -> {
-                val existing = existingJob.bookId.takeIf { it > 0 }?.let { bookDao.findById(it) }
-                val current = jobDao.getById(existingJob.id)
-                if (current?.status == "cancelled") return Result.failure()
-                if (existing != null) {
-                    val before = bookDao.findByFilePath(outputPath)
-                    android.util.Log.d("FFF-Dup", "recoverUpdate title=${existing.title} path=${outputPath} existingId=${existing.id} before=${before?.id}")
-                    val saved = upsertBook(bookDao, existing.copy(filePath = outputPath, lastModified = System.currentTimeMillis(), sizeBytes = file.length()), outputPath)
-                    android.util.Log.d("FFF-Dup", "recoverUpdate updated id=${saved.id}")
-                }
-                jobDao.update(
-                    existingJob.copy(
-                        status = "success",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("completed", indeterminate = false)
-                Result.success()
-            }
-            else -> Result.failure()
-        }
+        ensureWorkerActive("recover_success")
+        // A completed worker must not replay library writes or overwrite its warning payload.
+        if (jobDao.getById(existingJob.id)?.status != "success") return Result.failure()
+        if (type == TYPE_METADATA) return Result.success()
+        val path = existingJob.outputPath?.takeIf { it.isNotBlank() } ?: return Result.failure()
+        if (existingJob.bookId > 0 && bookDao.findById(existingJob.bookId)?.filePath != path) return Result.failure()
+        val file = File(path)
+        return if (file.isFile && file.length() > 0) Result.success() else Result.failure()
     }
 
     /**
@@ -489,18 +353,29 @@ class FanFicFareWorker(
      * for an idle queue. It never kills the work.
      */
     private suspend fun <T> withEngineHeartbeat(type: String, block: suspend () -> T): T = coroutineScope {
-        val startedAt = System.currentTimeMillis()
-        val beat = launch {
-            while (true) {
-                delay(HEARTBEAT_MS)
-                val seconds = (System.currentTimeMillis() - startedAt) / 1000
-                logWorker("heartbeat", "gate_heartbeat type=$type elapsed=${seconds}s")
-                updateForegroundNotification("Running $type · ${seconds}s")
+        val startedAt = SystemClock.elapsedRealtime()
+        val normalCleanup = java.util.concurrent.atomic.AtomicBoolean(false)
+        val beat = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            try {
+                while (true) {
+                    delay(HEARTBEAT_MS)
+                    val seconds = (SystemClock.elapsedRealtime() - startedAt) / 1000
+                    logWorker("heartbeat", "gate_heartbeat type=$type elapsed=${seconds}s")
+                    updateForegroundNotification("Running $type · ${seconds}s")
+                }
+            } catch (e: CancellationException) {
+                // Runs on cancellation even when synchronous Python has not returned yet.
+                // Normal beat.cancel() after a completed bridge is not a scheduler stop.
+                if (QueueJobPolicy.shouldLogHeartbeatStop(normalCleanup.get(), isStopped)) {
+                    logWorker("heartbeat_cancelled", "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt} error_class=${e.javaClass.simpleName}")
+                }
+                throw e
             }
         }
         try {
             block()
         } finally {
+            normalCleanup.set(true)
             beat.cancel()
         }
     }
@@ -537,11 +412,24 @@ class FanFicFareWorker(
      */
     private suspend fun callBridgeWithRetry(
         label: String,
+        bridge: PythonBridge,
         call: () -> String
     ): String {
         var attempt = 0
         while (true) {
+            ensureWorkerActive("bridge_call")
+            val started = SystemClock.elapsedRealtime()
+            logWorker("bridge_start", "bridge_attempt=${attempt + 1} operation_label=$label")
+            bridge.setDownloadDiagnosticContext(JSONObject()
+                .put("job_id", diagnosticJobId)
+                .put("work_name", inputData.getString(KEY_WORK_ID).orEmpty())
+                .put("request_id", id.toString())
+                .put("run_attempt", runAttemptCount)
+                .put("operation", inputData.getString(KEY_TYPE).orEmpty())
+                .put("bridge_attempt", attempt + 1).toString())
             val raw = call()
+            logWorker("bridge_return", "bridge_attempt=${attempt + 1} response_length=${raw.length} elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+            ensureWorkerActive("bridge_return")
             val status = retryableHttpStatus(raw)
             if (status == null || attempt >= SERVER_RETRY_DELAYS_MS.size) return raw
             val delayMs = SERVER_RETRY_DELAYS_MS[attempt]
@@ -573,7 +461,7 @@ class FanFicFareWorker(
         job: DownloadJobEntity
     ): Result {
         if (url.isBlank()) {
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "Missing URL",
@@ -583,38 +471,20 @@ class FanFicFareWorker(
             setPhase("failed")
             return Result.failure()
         }
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
+        ensureWorkerActive("operation_boundary")
         setPhase("downloading")
 
         val bridge = PythonBridge(applicationContext)
         val outputDir = applicationContext.filesDir.absolutePath
-        logWorker("handleDownload", "bridge_call url=$url outputDir=$outputDir")
-        val raw = callBridgeWithRetry("handleDownload") { bridge.fanficfareDownload(url, outputDir) }
+        logWorker("handleDownload", "bridge_call")
+        val raw = callBridgeWithRetry("handleDownload", bridge) { bridge.fanficfareDownload(url, outputDir) }
         logWorker("handleDownload", "bridge_raw_len=${raw.length}")
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
+        ensureWorkerActive("operation_boundary")
         val result = try {
             JSONObject(raw)
         } catch (e: Exception) {
-            logWorker("handleDownload", "json_parse_failed type=${e.javaClass.simpleName} msg=${e.message ?: ""} raw_prefix=${raw.take(200)}")
-            jobDao.update(
+            logWorker("handleDownload", "json_parse_failed error_class=${e.javaClass.simpleName} response_length=${raw.length}")
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "Invalid response from bridge: ${e.message ?: "unknown"}",
@@ -627,8 +497,8 @@ class FanFicFareWorker(
         logWorker("handleDownload", "result_json_ok=${result.optBoolean("ok")} title=${result.optString("title", "")}")
         if (!result.optBoolean("ok")) {
             val errorMsg = result.optString("error", "unknown")
-            logWorker("handleDownload", "result_error=$errorMsg raw_prefix=$raw")
-            jobDao.update(
+            logWorker("handleDownload", "bridge_failure http_status=${result.optInt("http_status", -1)} error_length=${errorMsg.length}")
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = errorMsg,
@@ -643,7 +513,7 @@ class FanFicFareWorker(
         val internalPath = result.optString("path", "")
         logWorker("handleDownload", "result_path=$internalPath")
         if (internalPath.isBlank()) {
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "missing output path",
@@ -657,7 +527,7 @@ class FanFicFareWorker(
         val source = File(internalPath)
         logWorker("handleDownload", "source_path=$internalPath exists=${source.exists()} isFile=${source.isFile} size=${source.length()}")
         if (!source.exists() || !source.isFile) {
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "generated file missing",
@@ -667,16 +537,7 @@ class FanFicFareWorker(
             setPhase("failed")
             return Result.failure()
         }
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
+        ensureWorkerActive("operation_boundary")
         setPhase("processing")
 
         val savedOutputDir = SettingsActivity.getOutputDir(applicationContext)
@@ -686,8 +547,9 @@ class FanFicFareWorker(
             logWorker("handleDownload", "copied_to=$copied")
             copied
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             logWorker("handleDownload", "copy_exception=${e.javaClass.simpleName}: ${e.message}")
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = e.message,
@@ -699,16 +561,7 @@ class FanFicFareWorker(
         } finally {
             source.delete()
         }
-        if (isStopped) {
-            jobDao.update(
-                job.copy(
-                    status = "cancelled",
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
-            setPhase("cancelled")
-            return Result.failure()
-        }
+        ensureWorkerActive("operation_boundary")
         setPhase("copying")
 
         val author = result.optString("author", "")
@@ -734,42 +587,14 @@ class FanFicFareWorker(
             sourceUriString = finalPath
         ).toEntity()
 
-        val before = bookDao.findByFilePath(finalPath)
-        android.util.Log.d("FFF-Dup", "handleDownload title=${entity.title} path=${finalPath} before=${before?.id}")
-        val saved = upsertBook(bookDao, entity, finalPath)
-        android.util.Log.d("FFF-Dup", "handleDownload inserted id=${saved.id}")
-        logWorker("handleDownload", "upserted id=${saved.id} path=$finalPath")
-        jobDao.update(
-            job.copy(
-                bookId = saved.id,
-                status = "success",
-                outputPath = finalPath,
-                finishedAt = System.currentTimeMillis()
-            )
-        )
-        // The story is now in the library, so any older row for the same URL is
-        // obsolete: without this, a failed/queued row from an earlier attempt (or
-        // from the enqueue race fixed in v1.10) stays in the queue asking to be
-        // retried or removed for a book that is already downloaded.
-        supersedeOlderJobsForSameStory(jobDao, url, job.id)
+        if (!completeBook(bookDao, jobDao, entity, finalPath,
+            job.copy(status = "success", outputPath = finalPath,
+                resultJson = DownloadOutcome.compact(result),
+                error = null, finishedAt = System.currentTimeMillis()))) return Result.failure()
+        // Failed and explicitly cancelled attempts stay visible until Retry/Remove.
+        logWorker("handleDownload", DownloadWarnings.parse(result).completionMessage("EPUB saved"))
         setPhase("completed", indeterminate = false)
         return Result.success()
-    }
-
-    /**
-     * Retire older job rows for the same story URL once one of them has succeeded.
-     * They are marked cancelled, which removes them from the download queue.
-     */
-    private suspend fun supersedeOlderJobsForSameStory(jobDao: DownloadJobDao, url: String, keepJobId: Long) {
-        try {
-            val now = System.currentTimeMillis()
-            for (stale in jobDao.findSuperseded(url, keepJobId)) {
-                jobDao.update(stale.copy(status = "cancelled", finishedAt = now))
-                logWorker("doWork", "superseded_stale_job id=${stale.id} was=${stale.status}")
-            }
-        } catch (e: Exception) {
-            logWorker("doWork", "supersede_failed=${e.message}")
-        }
     }
 
     private suspend fun handleUpdate(
@@ -787,7 +612,7 @@ class FanFicFareWorker(
         } else bookDao.findByFilePath(recoveredInputPath)
         val path = LibraryEpubStorage.existingPath(existing?.filePath, recoveredInputPath)
         if (path.isBlank()) {
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "missing input path",
@@ -803,33 +628,21 @@ class FanFicFareWorker(
         check(workDir.mkdirs()) { "Cannot create EPUB staging directory" }
         try {
             val outputDir = workDir.absolutePath
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("downloading")
             val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
-                callBridgeWithRetry("handleUpdate") { bridge.updateEpubFromPath(localFile.absolutePath, outputDir) }
-            } ?: error("Cannot read existing EPUB at $path. Refresh the library and retry.")
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
+                callBridgeWithRetry("handleUpdate", bridge) { bridge.updateEpubFromPath(localFile.absolutePath, outputDir) }
+            } ?: run {
+                jobDao.updateFromWorker(job.copy(status = "failed",
+                    error = "Existing EPUB is missing or unreadable. Use Force Download to restore it from the saved story URL.",
+                    finishedAt = System.currentTimeMillis()))
+                setPhase("failed")
                 return Result.failure()
             }
+            ensureWorkerActive("operation_boundary")
             val result = JSONObject(raw)
             if (!result.optBoolean("ok")) {
-                jobDao.update(
+                jobDao.updateFromWorker(
                     job.copy(
                         status = "failed",
                         error = result.optString("error", "unknown"),
@@ -843,40 +656,23 @@ class FanFicFareWorker(
             val title = result.optString("title", existing?.title ?: "story")
             val internalPath = result.optString("path", "")
             if (result.optBoolean("skipped")) {
-                jobDao.update(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
-                    outputPath = path, finishedAt = System.currentTimeMillis()))
+                jobDao.updateFromWorker(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
+                    outputPath = path, resultJson = DownloadOutcome.compact(result),
+                    finishedAt = System.currentTimeMillis()))
                 setPhase("completed", indeterminate = false)
                 return Result.success()
             }
             check(internalPath.isNotBlank() && File(internalPath).isFile) {
                 "Generated EPUB is missing; the original was kept"
             }
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("processing")
             val finalPath = try {
                 StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
             } finally {
                 if (File(internalPath).canonicalPath != File(path).canonicalPath) File(internalPath).delete()
             }
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("copying")
             val updated = if (existing != null) {
                 existing.copy(
@@ -886,7 +682,7 @@ class FanFicFareWorker(
                     sourcePath = LibraryEpubStorage.sourceAfterReplacement(existing.filePath, existing.sourcePath, finalPath),
                     lastModified = result.optLong("modified", System.currentTimeMillis()),
                     sizeBytes = result.optLong("size", 0L),
-                    coverData = result.optString("cover", existing.coverData ?: ""),
+                    coverData = result.optString("cover", "").ifBlank { existing.coverData ?: "" },
                     url = result.optString("url", existing.url ?: ""),
                     chapters = result.optInt("chapters", existing.chapters)
                 )
@@ -903,23 +699,11 @@ class FanFicFareWorker(
                     sourceUriString = finalPath
                 ).toEntity()
             }
-            val current = jobDao.getById(job.id)
-            if (current?.status == "cancelled") {
-                setPhase("cancelled")
-                return Result.failure()
-            }
-            val before = bookDao.findByFilePath(finalPath)
-            android.util.Log.d("FFF-Dup", "handleUpdate title=${updated.title} path=${finalPath} existingId=${existing?.id} before=${before?.id}")
-            val saved = upsertBook(bookDao, updated, finalPath)
-            android.util.Log.d("FFF-Dup", "handleUpdate inserted id=${saved.id}")
-            jobDao.update(
-                job.copy(
-                    bookId = saved.id,
-                    status = "success",
-                    outputPath = finalPath,
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
+            if (!completeBook(bookDao, jobDao, updated, finalPath,
+                job.copy(status = "success", outputPath = finalPath,
+                    resultJson = DownloadOutcome.compact(result),
+                    error = null, finishedAt = System.currentTimeMillis()))) return Result.failure()
+            logWorker("completion", DownloadWarnings.parse(result).completionMessage("EPUB saved"))
             setPhase("completed", indeterminate = false)
             return Result.success()
         } finally { workDir.deleteRecursively() }
@@ -939,8 +723,10 @@ class FanFicFareWorker(
                 ?: error("Book is no longer in the library. Reload the library before applying.")
         } else bookDao.findByFilePath(recoveredInputPath)
         val path = LibraryEpubStorage.existingPath(existing?.filePath, recoveredInputPath)
-        if (path.isBlank()) {
-            jobDao.update(
+        val fallbackUrl = existing?.url
+        val replaceAllowed = path.startsWith("content://") || File(path).isFile
+        if (path.isBlank() && fallbackUrl.isNullOrBlank()) {
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "missing input path",
@@ -956,33 +742,20 @@ class FanFicFareWorker(
         check(workDir.mkdirs()) { "Cannot create EPUB staging directory" }
         try {
             val outputDir = workDir.absolutePath
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("downloading")
             val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
-                callBridgeWithRetry("handleForceDownload") { bridge.forceDownloadFromEpub(localFile.absolutePath, outputDir) }
-            } ?: error("Cannot read existing EPUB at $path. Refresh the library and retry.")
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
+                callBridgeWithRetry("handleForceDownload", bridge) {
+                    bridge.forceDownloadFromEpub(localFile.absolutePath, outputDir, fallbackUrl)
+                }
+            } ?: run {
+                logWorker("force_recovery", "local_epub_unavailable saved_url=${!fallbackUrl.isNullOrBlank()}")
+                callBridgeWithRetry("handleForceDownload", bridge) { bridge.forceDownloadFromEpub("", outputDir, fallbackUrl) }
             }
+            ensureWorkerActive("operation_boundary")
             val result = JSONObject(raw)
             if (!result.optBoolean("ok")) {
-                jobDao.update(
+                jobDao.updateFromWorker(
                     job.copy(
                         status = "failed",
                         error = result.optString("error", "unknown"),
@@ -996,49 +769,36 @@ class FanFicFareWorker(
             val title = result.optString("title", existing?.title ?: "story")
             val internalPath = result.optString("path", "")
             if (result.optBoolean("skipped")) {
-                jobDao.update(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
-                    outputPath = path, finishedAt = System.currentTimeMillis()))
+                jobDao.updateFromWorker(job.copy(status = "success", bookId = existing?.id ?: job.bookId,
+                    outputPath = path, resultJson = DownloadOutcome.compact(result),
+                    finishedAt = System.currentTimeMillis()))
                 setPhase("completed", indeterminate = false)
                 return Result.success()
             }
             check(internalPath.isNotBlank() && File(internalPath).isFile) {
                 "Generated EPUB is missing; the original was kept"
             }
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("processing")
             val finalPath = try {
-                StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
+                LibraryEpubStorage.saveForced(File(internalPath), path,
+                    replaceAllowed = replaceAllowed,
+                    replaceExisting = { source, target -> StorageBridge.replaceExistingEpub(applicationContext, source, target) },
+                    recoveryCopy = { source -> StorageBridge.saveUpdatedDocumentCopy(applicationContext, source) })
             } finally {
                 if (File(internalPath).canonicalPath != File(path).canonicalPath) File(internalPath).delete()
             }
-            if (isStopped) {
-                jobDao.update(
-                    job.copy(
-                        status = "cancelled",
-                        finishedAt = System.currentTimeMillis()
-                    )
-                )
-                setPhase("cancelled")
-                return Result.failure()
-            }
+            ensureWorkerActive("operation_boundary")
             setPhase("copying")
             val updatedEntity = if (existing != null) {
                 existing.copy(
+                    id = existing.id,
                     title = title,
                     filePath = finalPath,
                     sourcePath = LibraryEpubStorage.sourceAfterReplacement(existing.filePath, existing.sourcePath, finalPath),
                     lastModified = result.optLong("modified", System.currentTimeMillis()),
                     sizeBytes = result.optLong("size", 0L),
-                    coverData = result.optString("cover", existing.coverData ?: ""),
+                    coverData = result.optString("cover", "").ifBlank { existing.coverData ?: "" },
                     url = result.optString("url", existing.url ?: ""),
                     chapters = result.optInt("chapters", existing.chapters)
                 )
@@ -1055,23 +815,11 @@ class FanFicFareWorker(
                     sourceUriString = finalPath
                 ).toEntity()
             }
-            val current = jobDao.getById(job.id)
-            if (current?.status == "cancelled") {
-                setPhase("cancelled")
-                return Result.failure()
-            }
-            val before = bookDao.findByFilePath(finalPath)
-            android.util.Log.d("FFF-Dup", "handleForceDownload title=${updatedEntity.title} path=${finalPath} existingId=${existing?.id} before=${before?.id}")
-            val saved = upsertBook(bookDao, updatedEntity, finalPath)
-            android.util.Log.d("FFF-Dup", "handleForceDownload inserted id=${saved.id}")
-            jobDao.update(
-                job.copy(
-                    bookId = saved.id,
-                    status = "success",
-                    outputPath = finalPath,
-                    finishedAt = System.currentTimeMillis()
-                )
-            )
+            if (!completeBook(bookDao, jobDao, updatedEntity, finalPath,
+                job.copy(status = "success", outputPath = finalPath,
+                    resultJson = DownloadOutcome.compact(result),
+                    error = null, finishedAt = System.currentTimeMillis()))) return Result.failure()
+            logWorker("completion", DownloadWarnings.parse(result).completionMessage("EPUB saved"))
             setPhase("completed", indeterminate = false)
             return Result.success()
         } finally { workDir.deleteRecursively() }
@@ -1083,7 +831,7 @@ class FanFicFareWorker(
         job: DownloadJobEntity
     ): Result {
         if (url.isBlank()) {
-            jobDao.update(
+            jobDao.updateFromWorker(
                 job.copy(
                     status = "failed",
                     error = "Missing URL",
@@ -1095,14 +843,14 @@ class FanFicFareWorker(
         }
         val bridge = PythonBridge(applicationContext)
         setPhase("fetching_metadata")
-        val raw = callBridgeWithRetry("handleMetadata") { bridge.fanficfareMetadata(url) }
+        val raw = callBridgeWithRetry("handleMetadata", bridge) { bridge.fanficfareMetadata(url) }
         val result = JSONObject(raw)
         val status = if (result.optBoolean("ok")) "success" else "failed"
         val errorMessage = result.optString("error", "")
         if (errorMessage.isNotBlank()) {
-            android.util.Log.e("FanFicFareWorker", "FanFicFare error: $errorMessage")
+            logWorker("metadata_failure", "http_status=${result.optInt("http_status", -1)} error_length=${errorMessage.length}")
         }
-        jobDao.update(
+        jobDao.updateFromWorker(
             job.copy(
                 status = status,
                 error = errorMessage.ifBlank { null },

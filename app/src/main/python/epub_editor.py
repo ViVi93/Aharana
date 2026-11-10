@@ -510,7 +510,16 @@ def _write_contributors(meta, contributors):
                 fa_meta.text = file_as
 
 
-def read_metadata_fields(epub_path):
+def _notify_read_error(callback, error):
+    """Optional diagnostic side channel; never alter the reader's public result."""
+    if callback is not None:
+        try:
+            callback(error)
+        except Exception:
+            pass
+
+
+def read_metadata_fields(epub_path, _on_error=None):
     """
     Read structured metadata fields from an EPUB's OPF.
 
@@ -520,12 +529,14 @@ def read_metadata_fields(epub_path):
         with zipfile.ZipFile(epub_path, "r") as z:
             opf_name = _find_opf_path(z)
             if not opf_name:
+                _notify_read_error(_on_error, ValueError('Missing OPF'))
                 return {"ok": False, "error": "No OPF file found in EPUB"}
             opf_data = z.read(opf_name)
             root = ET.fromstring(opf_data)
 
             meta = _get_all_metadata_elements(root)
             if meta is None:
+                _notify_read_error(_on_error, ValueError('Missing metadata'))
                 return {"ok": False, "error": "No metadata element found in OPF"}
 
             result = {
@@ -619,6 +630,7 @@ def read_metadata_fields(epub_path):
 
             return {"ok": True, "metadata": result, "path_in_epub": opf_name}
     except Exception as e:
+        _notify_read_error(_on_error, e)
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 

@@ -137,7 +137,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="No personal.ini imported"
+                android:text="Loading configuration…"
                 android:textSize="@dimen/m3_body_medium" />
 
             <com.google.android.material.button.MaterialButton
@@ -172,11 +172,35 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Preview: latest 30 lines, at most 32 KiB read and 1,024 characters per line. Long entries show their ending. Share includes all retained diagnostics within the existing export safety limits."
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/buttonShareSettingsDiagnostics"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Share full diagnostics"
+                style="@style/Widget.Material3Expressive.Button.OutlinedButton" />
+
+            <TextView
+                android:id="@+id/textSettingsExportStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Sharing does not need Python."
+                android:textAppearance="?attr/textAppearanceBodySmall"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+
+            <TextView
                 android:id="@+id/textPythonDebugLog"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="No log yet"
+                android:text="Loading latest debug entries…"
                 android:textSize="@dimen/m3_body_small" />
 
             <LinearLayout

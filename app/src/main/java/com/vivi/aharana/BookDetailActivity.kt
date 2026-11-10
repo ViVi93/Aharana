@@ -207,21 +207,7 @@ class BookDetailActivity : BaseActivity() {
     }
 
     private fun openBook() {
-        val file = File(bookPath)
-        val uri = when {
-            file.exists() && file.isFile -> FileProvider.getUriForFile(this, "${packageName}.provider", file)
-            else -> Uri.parse(bookPath)
-        }
-        val mime = if (bookPath.startsWith("content://")) contentResolver.getType(uri) ?: "application/epub+zip" else "application/epub+zip"
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            showMessage("No EPUB reader installed")
-        }
+        EpubOpener.open(this, bookPath, ::showMessage)
     }
 
     private fun updateBook() = downloadExistingBook(force = false)
@@ -252,6 +238,8 @@ class BookDetailActivity : BaseActivity() {
                             ?: error("Book is no longer in the library. Reload the library before applying.")
                     } else bookDao.findByFilePath(resolvedPath)
                     val path = LibraryEpubStorage.existingPath(existing?.filePath, resolvedPath)
+                    val fallbackUrl = existing?.url
+                    val replaceAllowed = path.startsWith("content://") || File(path).isFile
                     val bridge = PythonBridge(applicationContext)
                     check(bridge.getInitError() == null) { "Bridge not available: ${bridge.getInitError()}" }
                     val workDir = File(cacheDir, "epub-detail-${java.util.UUID.randomUUID()}")
@@ -260,10 +248,13 @@ class BookDetailActivity : BaseActivity() {
                         DiagnosticLog.append(this, tag, "bridge_start input=$path")
                         val raw = StorageBridge.withLocalEpub(applicationContext, path) { localFile ->
                             FanFicFareGate.runBlocking {
-                                if (force) bridge.forceDownloadFromEpub(localFile.absolutePath, workDir.absolutePath)
+                                if (force) bridge.forceDownloadFromEpub(localFile.absolutePath, workDir.absolutePath, fallbackUrl)
                                 else bridge.updateEpubFromPath(localFile.absolutePath, workDir.absolutePath)
                             }
-                        } ?: error("Cannot read EPUB from this location. Refresh the library and retry.")
+                        } ?: if (force) {
+                            DiagnosticLog.append(this, tag, "force_recovery local_epub_unavailable saved_url=${!fallbackUrl.isNullOrBlank()}")
+                            FanFicFareGate.runBlocking { bridge.forceDownloadFromEpub("", workDir.absolutePath, fallbackUrl) }
+                        } else error("Existing EPUB is missing or unreadable. Use Force Download to restore it from the saved story URL.")
                         val response = JSONObject(raw)
                         DiagnosticLog.append(this, tag, "bridge_returned ok=${response.optBoolean("ok")} skipped=${response.optBoolean("skipped")}")
                         if (!response.optBoolean("ok")) {
@@ -274,7 +265,11 @@ class BookDetailActivity : BaseActivity() {
                         if (!response.optBoolean("skipped")) {
                             val internalPath = response.optString("path")
                             check(internalPath.isNotBlank()) { "Bridge returned no generated EPUB; the original was kept" }
-                            val finalPath = StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
+                            val finalPath = if (force) LibraryEpubStorage.saveForced(File(internalPath), path,
+                                replaceAllowed = replaceAllowed,
+                                replaceExisting = { source, target -> StorageBridge.replaceExistingEpub(applicationContext, source, target) },
+                                recoveryCopy = { source -> StorageBridge.saveUpdatedDocumentCopy(applicationContext, source) })
+                            else StorageBridge.replaceExistingEpub(applicationContext, File(internalPath), path)
                             val sourcePath = LibraryEpubStorage.sourceAfterReplacement(
                                 existing?.filePath ?: bookPath, existing?.sourcePath ?: bookSource, finalPath)
                             if (existing != null) {
@@ -285,14 +280,15 @@ class BookDetailActivity : BaseActivity() {
                                     sourcePath = sourcePath,
                                     lastModified = response.optLong("modified", System.currentTimeMillis()),
                                     sizeBytes = File(finalPath).length(),
-                                    coverData = response.optString("cover", existing.coverData ?: ""),
+                                    coverData = response.optString("cover", "").ifBlank { existing.coverData ?: "" },
                                     url = response.optString("url", existing.url ?: ""),
                                     chapters = response.optInt("chapters", existing.chapters)
                                 ))
                             }
                             response.put("path", finalPath).put("source", sourcePath)
                             response.put("library_persisted", existing != null)
-                            DiagnosticLog.append(this, tag, "result=SUCCESS path=$finalPath")
+                            DiagnosticLog.append(this, tag,
+                                DownloadWarnings.parse(response).completionMessage("result=SUCCESS path=$finalPath"))
                         } else {
                             DiagnosticLog.append(this, tag, "result=SKIPPED reason=${response.optString("reason")}")
                         }
@@ -306,7 +302,9 @@ class BookDetailActivity : BaseActivity() {
                         showMessage("$label skipped: ${result.optString("reason", "already current")}")
                     } else {
                         val title = result.optString("title", bookTitle)
-                        Toast.makeText(applicationContext, if (force) "Force downloaded: $title" else "Updated: $title", Toast.LENGTH_LONG).show()
+                        Toast.makeText(applicationContext,
+                            DownloadWarnings.parse(result).completionMessage(if (force) "Force downloaded: $title" else "Updated: $title"),
+                            Toast.LENGTH_LONG).show()
                         if (!isFinishing && !isDestroyed) {
                             window?.decorView?.postDelayed({
                                 if (!isFinishing && !isDestroyed) finishWithResult(title,

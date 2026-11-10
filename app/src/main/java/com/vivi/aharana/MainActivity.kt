@@ -71,7 +71,7 @@ class MainActivity : BaseActivity() {
             pythonBridge?.initialize(SettingsActivity.getConfigDir(this).absolutePath)
             DiagnosticLog.append(this, "Main.Startup", "bridge_ready elapsed=${System.currentTimeMillis() - t0}")
 
-            val repository = BookRepository(this)
+            val repository = BookRepository.getInstance(this)
             DiagnosticLog.append(this, "Main.Startup", "repository_ready elapsed=${System.currentTimeMillis() - t0}")
 
             viewModel = ViewModelProvider(this, ViewModelFactory(repository))[LibraryViewModel::class.java]
@@ -90,7 +90,7 @@ class MainActivity : BaseActivity() {
                     "queued" -> "Queued"
                     "waiting" -> "Waiting..."
                     "running" -> "Running..."
-                    "success" -> "✓ Complete"
+                    "success" -> DownloadWarnings.parse(latest.resultJson).completionMessage("✓ Complete")
                     "failed" -> "✗ Failed"
                     "cancelled" -> "⏹ Cancelled"
                     else -> latest.status.replaceFirstChar { it.uppercase() }
@@ -124,6 +124,7 @@ class MainActivity : BaseActivity() {
 
             viewModel.configureFilters(applicationContext)
             viewModel.filterProgress.observe(this) { updateFilterSummary() }
+            viewModel.filterDataUpdates.observe(this) { updateFilterSummary() }
             viewModel.filterError.observe(this) { message ->
                 if (message.isNotBlank()) toast(message)
             }
@@ -174,7 +175,7 @@ class MainActivity : BaseActivity() {
                     "queued" -> "Queued"
                     "waiting" -> "Waiting..."
                     "running" -> "Running..."
-                    "success" -> "✓ Complete"
+                    "success" -> DownloadWarnings.parse(latest.resultJson).completionMessage("✓ Complete")
                     "failed" -> "✗ Failed"
                     "cancelled" -> "⏹ Cancelled"
                     else -> latest.status.replaceFirstChar { it.uppercase() }
@@ -232,6 +233,10 @@ class MainActivity : BaseActivity() {
                     }
                     R.id.action_filter_library -> {
                         showLibraryFilters()
+                        true
+                    }
+                    R.id.action_refresh_filter_data -> {
+                        LibraryFilterDialog(this, viewModel).show(force = true)
                         true
                     }
                     R.id.action_search -> {
@@ -432,6 +437,7 @@ class MainActivity : BaseActivity() {
 
     private fun showBookOptionsDialog(book: BookItem) {
         val options = mutableListOf<String>()
+        options.add("Open")
         if (book.url.isNotBlank()) {
             options.add("Update")
             options.add("Force Download")
@@ -444,6 +450,7 @@ class MainActivity : BaseActivity() {
             .setItems(options.toTypedArray()) { _, which ->
                 val choice = options[which]
                 when (choice) {
+                    "Open" -> EpubOpener.open(this, book.uriString, ::toast)
                     "Update" -> updateBook(book)
                     "Force Download" -> forceDownloadBook(book)
                     "Details" -> openBookDetail(book)
@@ -801,15 +808,18 @@ class MainActivity : BaseActivity() {
             "${LibraryFilters.categories[key]}: ${values.joinToString(", ")}"
         }
         val progress = viewModel.filterProgress.value.orEmpty()
+        val needsRefresh = viewModel.filterDataNeedsRefresh()
+        val refreshNote = if (needsRefresh) viewModel.filterDataStatus() else ""
         val summary = findViewById<android.widget.TextView>(R.id.libraryFilterSummary)
-        summary.visibility = if (progress.isNotBlank() || selected.isNotEmpty() || search.isNotBlank())
+        summary.visibility = if (progress.isNotBlank() || selected.isNotEmpty() || search.isNotBlank() || needsRefresh)
             android.view.View.VISIBLE else android.view.View.GONE
-        summary.text = when {
+        val criteria = when {
             progress.isNotBlank() -> "Filters · $progress"
             selected.isNotEmpty() -> "Filters · $visible/$total books · $active"
             search.isNotBlank() -> "Filters · $visible/$total books · search active"
             else -> "Filter library · $total books"
         }
+        summary.text = if (refreshNote.isNotBlank() && progress.isBlank()) "$criteria\n$refreshNote" else criteria
         val narrowed = selected.isNotEmpty() || search.isNotBlank()
         val presentation = LibraryListPresentation.choose(visible, viewModel.isRestoringLibrary(), progress.isNotBlank(), narrowed,
             indexReady = viewModel.filterIndexReady())
@@ -819,13 +829,13 @@ class MainActivity : BaseActivity() {
                 LibraryListPresentation.LOADING -> "Loading saved library…"
                 LibraryListPresentation.REFRESHING -> if (viewModel.filterIndexReady()) "Checking for changes…" else "Preparing library…"
                 LibraryListPresentation.NO_MATCHES -> "No matching books"
-                LibraryListPresentation.UNAVAILABLE -> "Filter index unavailable"
+                LibraryListPresentation.UNAVAILABLE -> "Filter data needs refresh"
                 else -> getString(R.string.empty_library_title)
             }
         findViewById<android.widget.TextView>(R.id.textEmptyLibrarySubtitle).text =
             when {
                 waiting -> "Your saved filters are kept. Results will appear when the index is ready."
-                presentation == LibraryListPresentation.UNAVAILABLE -> "Saved filters are kept. Open Filter library to retry or clear filters."
+                presentation == LibraryListPresentation.UNAVAILABLE -> "Saved filters are kept. Choose Refresh filter data in the menu, or clear filters to show all books."
                 narrowed -> "Change library filters or clear Search to show more books."
                 else -> getString(R.string.empty_library_subtitle)
             }

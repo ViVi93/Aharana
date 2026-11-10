@@ -33,6 +33,8 @@ from . import exceptions
 from . import fetchers
 from .fetchers import fetcher_nsapa_proxy
 from .fetchers import fetcher_flaresolverr_proxy
+from .fetchers import fetcher_cloudscraper
+from .fetchers import fetcher_camoufox
 
 ## has to be up here for brotli-dict to load correctly.
 from .browsercache import BrowserCache
@@ -108,6 +110,9 @@ formatsections = ['html','txt','epub','mobi']
 othersections = ['defaults','overrides']
 
 def get_valid_sections():
+    # Resolve after module initialization: configurable-first imports can
+    # leave the upstream circular-import workaround without an adapter module.
+    from . import adapters
     sites = adapters.getConfigSections()
     sitesections = list(othersections)
     for section in sites:
@@ -175,6 +180,7 @@ def get_valid_set_options():
     added to both.
     '''
 
+    from . import adapters
     valdict = {'collect_series':(None,None,boollist),
                'include_titlepage':(None,None,boollist),
                'include_tocpage':(None,None,boollist+['always']),
@@ -202,6 +208,8 @@ def get_valid_set_options():
                'use_nsapa_proxy':(None,None,boollist),
                'use_flaresolverr_proxy':(None,None,boollist+['withimages','directimages']),
                'use_flaresolverr_session':(None,None,boollist),
+               'use_camoufox':(None,None,boollist+['directimages']),
+               'do_camoufox_warmup':(None,None,boollist),
 
                ## currently, browser_cache_path is assumed to be
                ## shared and only ffnet uses it so far
@@ -234,6 +242,7 @@ def get_valid_set_options():
                'use_view_full_work':(otw_list+['fanfics.me'],None,boollist),
                'use_workskin':(otw_list,None,boollist),
                'remove_authorfootnotes_on_update':(otw_list,None,boollist),
+               'use_series_page_metadata':(otw_list,None,boollist),
                'use_archive_transformativeworks_org':(['archiveofourown.org'],None,boollist),
                'use_archiveofourown_gay':(['archiveofourown.org'],None,boollist),
 
@@ -390,6 +399,7 @@ def get_valid_keywords():
                  'file_start',
                  'fileformat',
                  'find_chapters',
+                 'first_chapter',
                  'fix_pseudo_html',
                  'flaresolverr_proxy_address',
                  'flaresolverr_proxy_port',
@@ -409,6 +419,7 @@ def get_valid_keywords():
                  'keep_empty_tags',
                  'keep_html_attrs',
                  'keep_summary_html',
+                 'last_chapter',
                  'logpage_end',
                  'logpage_entries',
                  'logpage_entry',
@@ -567,7 +578,7 @@ class Configuration(ConfigParser):
         self.basic_cache = basic_cache or fetchers.BasicCache()
         # don't create a browser cache by default.
         self.browser_cache = browser_cache
-        self.filelist_fetcher = None # used for _filelist
+        self.file_fetcher = None # used for _filelist and file://
 
         self.lightweight = lightweight
 
@@ -989,13 +1000,8 @@ class Configuration(ConfigParser):
         now with different caching.
         '''
 
-        if not self.filelist_fetcher:
-            # always use base requests fetcher for _filelist--odds are
-            # much higher user wants a file:// than something through
-            # browser cache or a proxy.
-            self.filelist_fetcher = fetchers.RequestsFetcher(self.getConfig,
-                                                             self.getConfigList)
-        ( data, redirecturl ) = self.filelist_fetcher.get_request_redirected(fn)
+        # Always use Requests for file lists, independently of proxies.
+        ( data, redirecturl ) = self.get_file_fetcher().get_request_redirected(fn)
         retval = None
         # NOT using website encoding reduce_zalgo etc decoding because again,
         # much more likely to be file://
@@ -1013,15 +1019,27 @@ class Configuration(ConfigParser):
 #### methods for fetching.  Moved here from base_adapter when
 #### *_filelist feature was added.
 
+    def get_file_fetcher(self):
+        if not self.file_fetcher:
+            self.file_fetcher = fetchers.RequestsFetcher(self.getConfig,
+                                                         self.getConfigList)
+        return self.file_fetcher
+
     def get_fetcher(self,
+                    url = None,
                     make_new = False):
+        if url and url.startswith('file:'):
+            return self.get_file_fetcher()
         cookiejar = None
         if self.fetcher is not None and make_new:
             cookiejar = self.get_fetcher().get_cookiejar()
             # save and re-apply cookiejar when make_new.
         if not self.fetcher or make_new:
 
-            if self.getConfig('use_flaresolverr_proxy',False):
+            if self.getConfig('use_camoufox',False):
+                logger.debug("use_camoufox:%s"%self.getConfig('use_camoufox'))
+                fetchcls = fetcher_camoufox.CamoufoxFetcher
+            elif self.getConfig('use_flaresolverr_proxy',False):
                 logger.debug("use_flaresolverr_proxy:%s"%self.getConfig('use_flaresolverr_proxy'))
                 fetchcls = fetcher_flaresolverr_proxy.FlareSolverr_ProxyFetcher
                 if (self.getConfig('include_images') and
@@ -1036,8 +1054,9 @@ class Configuration(ConfigParser):
                 fetchcls = fetcher_nsapa_proxy.NSAPA_ProxyFetcher
             elif self.getConfig('use_cloudscraper',False):
                 logger.debug("use_cloudscraper:%s"%self.getConfig('use_cloudscraper'))
-                fetchcls = fetchers.CloudScraperFetcher
+                fetchcls = fetcher_cloudscraper.CloudScraperFetcher
             else:
+                logger.debug("use normal requests fetcher")
                 fetchcls = fetchers.RequestsFetcher
             self.fetcher = fetchcls(self.getConfig,
                                     self.getConfigList)
@@ -1075,6 +1094,11 @@ class Configuration(ConfigParser):
 
             if self.getConfig('progressbar'):
                 fetchers.ProgressBarDecorator().decorate_fetcher(self.fetcher)
+
+            # Upstream request-boundary infrastructure only; Android does not
+            # register a callback or expose this as active cancellation.
+            self.quitdecor = fetchers.QuitDecorator()
+            self.quitdecor.decorate_fetcher(self.fetcher)
         if cookiejar is not None:
             self.fetcher.set_cookiejar(cookiejar)
         return self.fetcher
@@ -1082,6 +1106,9 @@ class Configuration(ConfigParser):
     ## used by plugin to change time for ffnet.
     def set_sleep_override(self,val):
         return self.sleeper.set_sleep_override(val)
+
+    def set_quit(self,fn):
+        self.quitdecor.set_quit(fn)
 
     def get_cookiejar(self,filename=None,mozilla=False):
         return self.get_fetcher().get_cookiejar(filename,mozilla)

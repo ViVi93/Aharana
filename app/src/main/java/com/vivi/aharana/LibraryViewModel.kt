@@ -50,21 +50,28 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
     private var userChoseFilters = false
     val filterProgress = MutableLiveData("")
     val filterError = MutableLiveData("")
+    private val _filterDataUpdates = MutableLiveData(0)
+    val filterDataUpdates: LiveData<Int> = _filterDataUpdates
     private val filterState by lazy {
         LibraryFilterState(viewModelScope, repository::getBooksSnapshot, ::signature,
             read = { book: BookItem -> checkNotNull(facetLoader).read(book) },
-            onChanged = { recomputeVisible() },
+            onChanged = {
+                recomputeVisible()
+                _filterDataUpdates.value = (_filterDataUpdates.value ?: 0) + 1
+            },
             onProgress = { filterProgress.value = it },
             onError = { filterError.value = it },
             persistSelection = { checkNotNull(facetLoader).saveSelection(it) },
             readFresh = { book: BookItem -> checkNotNull(facetLoader).read(book, force = true) },
-            loadCached = { rows -> checkNotNull(facetLoader).cached(rows) },
-            identity = { it.uriString })
+            loadCached = { rows -> checkNotNull(facetLoader).cached(rows, allowStale = true) },
+            identity = { it.uriString }, manualRefreshOnly = true,
+            cachedCurrentPaths = { rows -> checkNotNull(facetLoader).cached(rows).keys },
+            beginRefresh = { checkNotNull(facetLoader).beginRefresh() },
+            cachedUnreadablePaths = { rows -> checkNotNull(facetLoader).unreadable(rows) })
     }
     val filterReadFailures: Int get() = filterState.failures
     private val booksObserver = Observer<List<BookItem>> { books ->
-        recomputeVisible(books)
-        filterState.booksChanged()
+        filterState.booksChanged() // Manual reconciliation publishes the current projection once.
         if (filtersRestored) facetLoader?.let { loader ->
             loader.setMembership(books)
             reconcileJob?.cancel()
@@ -94,7 +101,9 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
                     jobId = latest.id,
                     type = latest.type,
                     status = latest.status,
-                    phase = humanizeJobStatus(latest.status),
+                    phase = if (latest.status == "success")
+                        DownloadWarnings.parse(latest.resultJson).completionMessage(humanizeJobStatus(latest.status))
+                    else humanizeJobStatus(latest.status),
                     indeterminate = false,
                     finished = true
                 )
@@ -167,8 +176,8 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
     fun projectLibrary(books: List<BookItem>): List<BookItem> {
         if (!filtersRestored) return emptyList() // Do not flash an unfiltered list during saved-choice restore.
         val selection = filterState.selection
-        // While refreshing, retain the previous coherent book/index pair. Never
-        // interpret a newly added/unscanned book as a negative filter match.
+        // Apply cached facets to current library rows. Unknown books are not evaluated
+        // by active filters; filterDataStatus explains how to include them.
         val existingPaths = repository.getBooksSnapshot().mapTo(hashSetOf()) { it.uriString }
         val base = if (selection.isEmpty()) books else filterState.indexedBooks.filter { it.uriString in existingPaths }
         val q = _searchQuery.value
@@ -196,15 +205,13 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
             catch (_: Exception) { filterError.value = "Saved filters could not be restored. Open Filter library to choose them again." }
             finally {
                 filtersRestored = true
-                filterProgress.value = if (filterState.selection.isNotEmpty() && !filterState.isFresh())
-                    "Preparing library…" else ""
+                filterProgress.value = ""
                 recomputeVisible()
             }
-            // Publish cached results first. Source stats and missing/changed metadata happen later.
+            // Prune removed identities only. Source checks/EPUB reads require explicit refresh.
             kotlinx.coroutines.yield()
             loader.setMembership(repository.getBooksSnapshot())
             loader.reconcile()
-            filterState.validateInBackground()
         }
         restoreFiltersJob = restore
         restore.start()
@@ -220,6 +227,27 @@ class LibraryViewModel(private val repository: BookRepository) : ViewModel() {
 
     fun filterOptions(key: String): Map<String, Int> = LibraryFilters.options(filterState.records.values, key)
     fun filterIndexReady(): Boolean = filtersRestored && filterState.isFresh()
+    fun filterDataNeedsRefresh(): Boolean = filtersRestored && filterState.needsRefresh()
+    fun filterDataPendingCount(): Int = filterState.pendingCount()
+    fun filterDataUnknownCount(): Int = filterState.unknownCount()
+    fun filterReadFailureSummary(): String {
+        val titles = repository.getBooksSnapshot().associate { it.uriString to it.title }
+        return filterState.unreadableSummary { titles[it] ?: "Book no longer in the library" }
+    }
+    fun filterDataStatus(): String {
+        if (!filtersRestored) return "Loading saved filter data…"
+        val pending = filterDataPendingCount()
+        val unknown = filterDataUnknownCount()
+        return when {
+            filterReadFailures > 0 -> "$filterReadFailures books unreadable. Their cached facets were kept where available; " +
+                "open Filter library for details or use Refresh filter data to retry."
+            pending > 0 -> "$pending new/changed books need Refresh filter data. " +
+                if (unknown > 0) "$unknown have no cached data and are not evaluated by active filters; clear filters to show them."
+                else "Their previous cached facets remain in use."
+            filterState.needsRefresh() -> "Filter data refresh is incomplete. Choose Refresh filter data to retry; cached results remain in use."
+            else -> "Using cached filter data. Choose Refresh filter data after external EPUB edits."
+        }
+    }
     fun isRestoringLibrary(): Boolean = !filtersRestored
 
     private fun signature(books: List<BookItem>): List<String> = books.map(LibraryFacetLoader::bookSignature).sorted()

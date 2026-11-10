@@ -1,6 +1,5 @@
 package com.vivi.aharana.adapter
 
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -16,6 +15,7 @@ import com.vivi.aharana.model.BookItem
 import com.vivi.aharana.util.CoverColorUtils
 import com.vivi.aharana.LibraryStoryStatus
 import com.vivi.aharana.LibraryStoryStatusLoader
+import com.vivi.aharana.LibraryCoverLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
@@ -35,6 +35,7 @@ class BookAdapter(
 
     private val _books = books.toMutableList()
     private var statusLoaderInstance: LibraryStoryStatusLoader? = null
+    private var coverLoaderInstance: LibraryCoverLoader? = null
 
     private fun loader(context: android.content.Context): LibraryStoryStatusLoader =
         statusLoaderInstance ?: LibraryStoryStatusLoader(context).also { statusLoaderInstance = it }
@@ -46,9 +47,17 @@ class BookAdapter(
         private val textChapters: TextView = itemView.findViewById(R.id.textChapters)
         private val textStatus: TextView = itemView.findViewById(R.id.textLibraryStatus)
         private var statusJob: Job? = null
+        private var coverJob: Job? = null
+        private var bindingVersion = 0L
+        private var coverLoaded = false
         private var boundPath: String? = null
 
         fun recycle() {
+            bindingVersion++
+            coverJob?.cancel()
+            coverJob = null
+            coverLoaded = false
+            imageCover.setImageDrawable(null)
             statusJob?.cancel()
             statusJob = null
             boundPath = null
@@ -106,29 +115,28 @@ class BookAdapter(
             // Set dynamic content description for accessibility
             imageCover.contentDescription = "Cover for ${book.title} by ${book.author}"
 
-            val cover = book.coverUriString
-            if (cover?.isNotBlank() == true && cover.startsWith("data:")) {
+            val version = bindingVersion
+            showPlaceholder(book, version)
+            val coverLoader = coverLoaderInstance ?: LibraryCoverLoader.getInstance(itemView.context)
+                .also { coverLoaderInstance = it }
+            coverJob = statusScope.launch {
                 try {
-                    val comma = cover.indexOf(",")
-                    if (comma > 0) {
-                        val base64 = cover.substring(comma + 1)
-                        val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
-                        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        if (bitmap != null) {
-                            imageCover.setImageBitmap(bitmap)
-                            imageCover.visibility = View.VISIBLE
-                            return
-                        }
+                    val bitmap = coverLoader.load(book)
+                    if (bindingVersion == version && bitmap != null) {
+                        coverLoaded = true
+                        imageCover.setImageBitmap(bitmap)
+                        imageCover.visibility = View.VISIBLE
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
-                    android.util.Log.d("FFF-Cover", "decodeByteArray failed: type=" + e.javaClass.simpleName + " msg=" + (e.message ?: ""))
+                    android.util.Log.d("FFF-Cover", "Cover load failed: ${e.javaClass.simpleName}")
                 }
             }
-            // No cover data - generate placeholder
-            showPlaceholder(book)
         }
 
-        private fun showPlaceholder(book: BookItem) {
+        private fun showPlaceholder(book: BookItem, version: Long) {
+            if (bindingVersion != version || coverLoaded) return
             val bgColor = CoverColorUtils.colorFromString(book.title)
             val textColor = CoverColorUtils.contrastingTextColor(bgColor)
             val initials = CoverColorUtils.initialsFromTitle(book.title, book.author)
@@ -137,7 +145,9 @@ class BookAdapter(
             val height = imageCover.height
             if (width <= 0 || height <= 0) {
                 imageCover.post {
-                    if (imageCover.width > 0 && imageCover.height > 0) showPlaceholder(book)
+                    if (bindingVersion == version && !coverLoaded && imageCover.width > 0 && imageCover.height > 0) {
+                        showPlaceholder(book, version)
+                    }
                 }
                 return
             }
@@ -239,6 +249,7 @@ class BookAdapter(
 
     fun updateBooks(newBooks: List<BookItem>) {
         statusLoaderInstance?.invalidate()
+        coverLoaderInstance?.invalidate()
         // Keep the selection for books that are still present; drop ids that are
         // gone (deleted or filtered out). Clearing unconditionally here is what
         // used to make a background book update silently drop the selection.

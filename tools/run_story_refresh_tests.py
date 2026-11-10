@@ -32,9 +32,12 @@ sources += sorted((repo / 'app/src/main/java/com/vivi/aharana').glob('LibraryLis
 sources += sorted((repo / 'app/src/test/java/com/vivi/aharana').glob('LibraryListPresentationTest.kt'))
 sources += sorted((repo / 'app/src/main/java/com/vivi/aharana').glob('LibraryFacetIndex.kt'))
 sources += sorted((repo / 'app/src/test/java/com/vivi/aharana').glob('LibraryFacetIndexTest.kt'))
+sources.append(repo / 'tests/LibraryFilterManualWiringTest.kt')
 with tempfile.TemporaryDirectory(prefix='StoryRefreshTests_', dir=os.environ.get('TMPDIR', str(repo / 'app/build'))) as output:
     subprocess.run(['java', '-cp', ':'.join(compiler), 'org.jetbrains.kotlin.cli.jvm.K2JVMCompiler',
                     '-no-stdlib', '-no-reflect', '-classpath', runtime, '-d', output,
                     *map(str, sources)], check=True)
     for suite in ('StoryRefreshFilesTest', 'StoryRefreshLibraryMetadataTest', 'LibraryStoryStatusTest', 'LibraryFiltersTest', 'LibraryFilterStateTest', 'LibraryListPresentationTest', 'LibraryFacetIndexTest'):
         subprocess.run(['java', '-Djava.io.tmpdir=' + os.environ.get('TMPDIR', str(repo / 'app/build')), '-cp', f'{output}:{runtime}', f'com.vivi.aharana.{suite}'], check=True)
+    subprocess.run(['java', '-cp', f'{output}:{runtime}',
+                    'com.vivi.aharana.LibraryFilterManualWiringTest', str(repo)], check=True)

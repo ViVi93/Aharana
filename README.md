@@ -116,9 +116,13 @@ _Coming soon._
 - All downloads run in the background through **WorkManager** with a foreground
   service notification and live progress/status (Queued → Preparing → Downloading →
   Processing → Copying → Complete).
-- **Download Queue** screen shows every job — queued, running, succeeded, failed or
-  cancelled — with **retry** and **remove** actions for failures.
-- **Cancel** an in-progress download from the menu.
+- **Download Queue** keeps queued/running jobs and failed/cancelled requests visible.
+  Failed and cancelled entries show a reason and **Retry / Remove** actions; normal
+  successes and legacy retired entries are hidden. Retry reuses the same queue row
+  with a fresh work identity, so an automatic resumption or double tap cannot submit
+  duplicate retries. Successful partial EPUBs remain visible with their chapter warnings.
+- **Cancel** an in-progress request from its queue row, or cancel all downloads
+  from the main menu. A system interruption is not treated as a user cancellation.
 - Images in the story text are downloaded into the EPUB on a normal download; update
   and force-download refresh the cover.
 
@@ -195,15 +199,22 @@ the parts of an anthology:
 
 ### Diagnostics
 
-- **Diagnostics** screen: Python runtime status, bridge/module status, app version,
-  a rolling diagnostic log (view last 30 lines, **clear**, or **share** the full log),
-  and a **FanFicFare import diagnostic** that reports per-import pass/fail with
-  tracebacks.
+- **Diagnostics** screen: Python runtime status, app version, a rolling diagnostic
+  log (view last 30 lines or **clear**) and a **FanFicFare import diagnostic**.
+  **Share** creates one ZIP containing retained app/engine logs, queue state and a
+  best-effort WorkManager snapshot, without waiting for a running Python download.
+- Worker records include the date, process/session, request/attempt identifiers,
+  storage/engine wait timings and Android stop reasons where available. Engine
+  records include chapter/request timings, text versus image fetches and retry
+  sleeps. They persist across downloads with bounded rotation; no configuration
+  files, request headers or response bodies are attached, and URL credentials and
+  query strings are redacted.
 - **Settings** also exposes a **Python download debug log** (refresh/clear) written by
   the download path, and a **DNS diagnostics** tool that repeats resolution attempts
   against the target host and a comparison host.
-- Startup, bridge initialisation and worker steps are timestamped in the diagnostic
-  log to make device-only issues debuggable.
+- Unknown stop reasons remain unknown; a device/process kill may prevent a final
+  event from being written. Power-state fields in the export describe export time,
+  not necessarily the time of an earlier interruption.
 
 ### Appearance
 
@@ -380,8 +391,8 @@ Release signing is optional and driven by Gradle properties; when present the
 2. On a push, attempts a **signed release** build (from the
    `SIGNING_KEY_STORE_BASE64` + alias/password repository secrets) and
    **falls back to an unsigned release** if signing credentials are absent or wrong.
-3. Uploads the APKs as the `fanficfare-apk` artifact.
-4. On a push, creates a **GitHub Release** tagged `build-<sha>` with the release APK
+3. Uploads the APKs as the `aharana-v<version>-apk` artifact.
+4. On a push, creates a **GitHub Release** tagged `v<version>` with the release APK
    (or the debug APK if no release was produced).
 
 ---

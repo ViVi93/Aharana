@@ -9,6 +9,9 @@ import kotlinx.coroutines.sync.withLock
  * Single-owner filter/index state, used on one dispatcher (the ViewModel main dispatcher).
  * Scans belong to the supplied scope, never an Activity. Dialogs own only awaiters.
  * A complete snapshot and its filters are published atomically; partial/failed work stays private.
+ * Production opts into manualRefreshOnly: cached data is usable without source validation,
+ * membership reconciliation prunes deleted identities, and only prepare(force=true) reads sources.
+ * Automatic mode is retained for legacy callers/tests, not the production ViewModel.
  */
 internal class LibraryFilterState<T>(
     private val scope: CoroutineScope,
@@ -21,7 +24,11 @@ internal class LibraryFilterState<T>(
     private val persistSelection: suspend (Map<String, Set<String>>) -> Unit = {},
     private val readFresh: suspend (T) -> Pair<LibraryFacetRecord, Boolean> = read,
     private val loadCached: suspend (List<T>) -> Map<String, LibraryFacetRecord> = { emptyMap() },
-    private val identity: (T) -> String = { signature(listOf(it)).single() }
+    private val identity: (T) -> String = { signature(listOf(it)).single() },
+    private val manualRefreshOnly: Boolean = false,
+    private val cachedCurrentPaths: (suspend (List<T>) -> Set<String>)? = null,
+    private val beginRefresh: (() -> LibraryFacetRefresh<T>)? = null,
+    private val cachedUnreadablePaths: suspend (List<T>) -> Set<String> = { emptySet() }
 ) {
     var selection: Map<String, Set<String>> = emptyMap()
         private set
@@ -46,8 +53,32 @@ internal class LibraryFilterState<T>(
     private var unreadablePaths: Set<String> = emptySet()
     private var validation = 0L
     private var publishedValidation = 0L
+    private var cacheRestored = false
+    private var recordRevisions: Map<String, List<String>> = emptyMap()
 
-    fun isFresh(): Boolean = indexedSignature == signature(snapshot()) && publishedInvalidation == invalidation
+    /** Matches known library revisions only; external changes require an explicit refresh. */
+    fun isFresh(): Boolean = if (manualRefreshOnly)
+        cacheRestored && pendingCount() == 0 && publishedInvalidation == invalidation
+        else indexedSignature == signature(snapshot()) && publishedInvalidation == invalidation
+
+    fun pendingCount(): Int = snapshot().count { book ->
+        identity(book) !in records || recordRevisions[identity(book)] != signature(listOf(book))
+    }
+
+    fun unknownCount(): Int = snapshot().count { identity(it) !in records }
+    fun needsRefresh(): Boolean = !isFresh() || failures > 0
+
+    fun unreadableSummary(label: (String) -> String): String {
+        if (failures == 0) return ""
+        val names = unreadablePaths.take(5).map { path ->
+            label(path).replace(Regex("[\\p{Cntrl}]"), " ").take(120).ifBlank { "Untitled book" }
+        }
+        return "$failures books could not be read (file access or EPUB metadata). " +
+            "Previous cached facets were kept where available; otherwise marked (Unreadable). " +
+            "Check files/permissions and use Refresh filter data to retry. Full reasons are in Diagnostics → Share.\n" +
+            names.joinToString("\n") { "• $it" } +
+            if (failures > names.size) "\n…and ${failures - names.size} more." else ""
+    }
 
     /** Restore derived data without source IO. Never replay a preference save at startup. */
     suspend fun restore(saved: Map<String, Set<String>>) {
@@ -56,12 +87,20 @@ internal class LibraryFilterState<T>(
             val books = snapshot().toList()
             val expected = signature(books)
             val cached = loadCached(books)
+            val currentPaths = cachedCurrentPaths?.invoke(books) ?: cached.keys
+            val failedPaths = cachedUnreadablePaths(books)
             coroutineContext.ensureActive()
             if (serial != applySerial) return // An explicit Apply/Clear always wins.
             if (expected != signature(snapshot())) continue
             val paths = books.mapTo(hashSetOf(), identity)
             records = cached.filter { (path, record) -> path in paths && record.path == path }
             indexedBooks = books.filter { identity(it) in records }
+            recordRevisions = books.filter { identity(it) in records && identity(it) in currentPaths }
+                .associate { identity(it) to signature(listOf(it)) }
+            cacheRestored = true
+            if (manualRefreshOnly) publishedInvalidation = invalidation
+            unreadablePaths = failedPaths.intersect(paths)
+            failures = unreadablePaths.size
             selection = saved.filter { it.key in LibraryFilters.categories && it.value.isNotEmpty() }
                 .mapValues { it.value.toSet() }
             if (indexedBooks.size == books.size) {
@@ -74,8 +113,9 @@ internal class LibraryFilterState<T>(
         }
     }
 
-    /** Preview cancellation only releases that preview; it cannot cancel an Apply or maintenance. */
+    /** Ordinary manual preview is cache-only. Forced preview owns a cancellable fresh reread. */
     suspend fun prepare(force: Boolean = false) {
+        if (manualRefreshOnly && !force) { reconcileMembership(); return }
         if (force) invalidation++
         waiters++
         try { awaitFresh() }
@@ -101,7 +141,11 @@ internal class LibraryFilterState<T>(
         val token = ++owner
         val task = scope.async(start = CoroutineStart.LAZY) {
             try {
+                var refresh = if (manualRefreshOnly) beginRefresh?.invoke() else null
+                var retrying = false
                 while (!isFresh() || validation > publishedValidation) {
+                    if (retrying) refresh = refresh?.restart()
+                    retrying = true
                     val books = snapshot().toList()
                     val expected = signature(books)
                     val version = invalidation
@@ -114,7 +158,8 @@ internal class LibraryFilterState<T>(
                     for ((index, book) in books.withIndex()) {
                         ensureActive()
                         if (owner == token && (index % 50 == 0 || index == books.lastIndex))
-                            onProgress(if (indexedSignature != null) "Checking for changes ${index + 1}/${books.size}…"
+                            onProgress(if (manualRefreshOnly) "Refreshing filter data ${index + 1}/${books.size}…"
+                                else if (indexedSignature != null) "Checking for changes ${index + 1}/${books.size}…"
                                 else "Preparing library ${index + 1}/${books.size}…")
                         val path = identity(book)
                         val force = version > publishedInvalidation && version > 0L
@@ -122,22 +167,31 @@ internal class LibraryFilterState<T>(
                         val reusable = !force && !checkSources && path !in unreadablePaths && oldBook != null &&
                             signature(listOf(oldBook)) == signature(listOf(book))
                         val prior = records[path]?.takeIf { reusable }
-                        val (record, readable) = if (prior != null) prior to true
+                        val (record, readable) = if (refresh != null) refresh.read(book)
+                            else if (prior != null) prior to true
                             else if (force) readFresh(book) else read(book)
                         next[record.path] = record
                         if (!readable) { errors++; failed.add(record.path) }
                     }
                     ensureActive()
-                    if (expected != signature(snapshot()) || version != invalidation) continue
-                    // No suspension from validation through publication on the owner dispatcher.
-                    records = next.toMap()
-                    indexedBooks = books
-                    failures = errors
-                    unreadablePaths = failed
-                    indexedSignature = expected
-                    publishedInvalidation = version
-                    publishedValidation = validating
-                    onChanged()
+                    val isCurrent = { owner == token && expected == signature(snapshot()) && version == invalidation }
+                    if (!isCurrent()) continue
+                    val publish = {
+                        records = next.toMap()
+                        indexedBooks = books
+                        failures = errors
+                        unreadablePaths = failed
+                        indexedSignature = expected
+                        recordRevisions = books.associate { identity(it) to signature(listOf(it)) }
+                        cacheRestored = true
+                        publishedInvalidation = version
+                        publishedValidation = validating
+                        // A library mutation AFTER commit acceptance is a later operation:
+                        // retain the accepted facets for surviving identities, never resurrect
+                        // deleted rows or mark edited/new revisions current.
+                        if (manualRefreshOnly) reconcileMembership() else onChanged()
+                    }
+                    if (refresh != null) refresh.commit(isCurrent, publish) else publish()
                 }
             } finally {
                 if (owner == token) onProgress("")
@@ -148,35 +202,46 @@ internal class LibraryFilterState<T>(
         return task
     }
 
-    /** Recheck at Apply, not merely when the dialog was opened. Newer Apply/Clear wins. */
+    /** Manual Apply only persists choices against the cached snapshot. Newer Apply/Clear wins. */
     fun apply(requested: Map<String, Set<String>>): Job {
         val draft = requested.filter { it.key in LibraryFilters.categories && it.value.isNotEmpty() }
             .mapValues { it.value.toSet() }
         val serial = ++applySerial
         applyJob?.cancel()
         val task = scope.launch(start = CoroutineStart.LAZY) {
-            pins++
+            if (!manualRefreshOnly) pins++
             try {
                 do {
-                    if (draft.isNotEmpty()) awaitFresh()
+                    if (!manualRefreshOnly && draft.isNotEmpty()) awaitFresh()
                     ensureActive()
                     // Finish atomic disk saves in request order, including superseded
                     // requests; the newer Apply/Clear must be last on disk as well.
                     withContext(NonCancellable) {
-                        persistenceMutex.withLock { persistSelection(draft) }
+                        persistenceMutex.withLock {
+                            persistSelection(draft)
+                            // Publish an accepted manual save even if its waiter was
+                            // cancelled during disk IO; newer Apply/Clear still wins.
+                            if (manualRefreshOnly && serial == applySerial) {
+                                selection = draft
+                                if (draft.isEmpty()) maintenance?.cancel()
+                                onChanged()
+                            }
+                        }
                     }
                     ensureActive()
                     if (serial != applySerial) return@launch
-                } while (draft.isNotEmpty() && !isFresh())
-                selection = draft
-                if (draft.isEmpty()) maintenance?.cancel()
-                onChanged()
+                } while (!manualRefreshOnly && draft.isNotEmpty() && !isFresh())
+                if (!manualRefreshOnly) {
+                    selection = draft
+                    if (draft.isEmpty()) maintenance?.cancel()
+                    onChanged()
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 onError("Filters could not be saved/applied. Previous filters and results were kept; reopen filters to retry.")
             } finally {
-                pins--
+                if (!manualRefreshOnly) pins--
                 cancelUnneededScan()
             }
         }
@@ -186,6 +251,7 @@ internal class LibraryFilterState<T>(
     }
 
     fun booksChanged() {
+        if (manualRefreshOnly) { reconcileMembership(); return }
         // Existing or pending scans independently revalidate their source before publishing.
         if (selection.isEmpty() || isFresh() || maintenance?.isActive == true) return
         maintenance = scope.launch {
@@ -198,8 +264,21 @@ internal class LibraryFilterState<T>(
         }
     }
 
+    /** Membership/revision reconciliation is in memory only, never source validation. */
+    private fun reconcileMembership() {
+        val books = snapshot().toList()
+        val paths = books.mapTo(hashSetOf(), identity)
+        records = records.filterKeys { it in paths }
+        recordRevisions = recordRevisions.filterKeys { it in paths }
+        indexedBooks = books.filter { identity(it) in records }
+        unreadablePaths = unreadablePaths.intersect(paths)
+        failures = unreadablePaths.size
+        onChanged()
+    }
+
     /** Source validation owns its pin independently of applied-filter maintenance and Clear. */
     fun validateInBackground(): Job {
+        if (manualRefreshOnly) return scope.launch { }
         validation++
         validationJob?.takeIf { it.isActive }?.let { return it }
         val task = scope.launch(start = CoroutineStart.LAZY) {
@@ -215,7 +294,7 @@ internal class LibraryFilterState<T>(
     }
 
     private fun cancelUnneededScan() {
-        if (waiters == 0 && pins == 0 && selection.isEmpty()) {
+        if (waiters == 0 && pins == 0 && (manualRefreshOnly || selection.isEmpty())) {
             scan?.cancel()
             // Clear immediately; a cancelled LAZY scan might never execute its finally.
             onProgress("")

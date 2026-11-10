@@ -49,7 +49,7 @@ class ShareReceiverActivity : BaseActivity() {
         val toast = android.widget.Toast.makeText(this, "Sharing download: ${android.net.Uri.parse(url).host ?: url}", android.widget.Toast.LENGTH_SHORT)
         toast.show()
         scope.launch {
-            BookRepository(this@ShareReceiverActivity).enqueueDownload(url)
+            BookRepository.getInstance(this@ShareReceiverActivity).enqueueDownload(url)
         }
         DiagnosticLog.append(this, "Main.Shared", "enqueued_download url=$url")
     }

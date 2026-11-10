@@ -67,9 +67,22 @@ class DownloadStorageWiringTest(unittest.TestCase):
         self.assertIn('TYPE_METADATA', entry)
         self.assertIn('doWorkUnlocked()', entry)
         self.assertIn('LibraryStorageGate.run', entry)
-        self.assertNotIn('markInterruptedJob(', entry, 'Cancelled gate waiters must not probe book paths outside storage exclusion')
+        interrupted = worker.split('private suspend fun markInterruptedJob(', 1)[1].split('private suspend fun upsertBook(', 1)[0]
+        self.assertIn('markInterruptedJob(', entry, 'Stopped gate waiters must retain an actionable failure')
+        self.assertIn('updateFromWorker(', interrupted, 'Preserve explicit Cancel/success/removal')
+        for filesystem_probe in ('File(', 'outputIsUsable(', 'exists(', 'length(', 'bookDao'):
+            self.assertNotIn(filesystem_probe, interrupted,
+                             'Interruption before storage exclusion must only touch the job row')
         self.assertIn('BookRepository.reconcileOrganisedPaths(applicationContext)', entry)
         self.assertIn('setForeground(getForegroundInfo())', entry, 'Promotion must happen before waiting for the storage gate')
+
+    def test_document_read_failure_logs_real_exception_and_null_stream_is_not_a_success(self):
+        storage = source('StorageBridge.kt')
+        method = storage.split('private fun copyContentUriToTemp(')[1].split('private fun queryDisplayName(')[0]
+        self.assertIn('DiagnosticLog.appendException', method)
+        self.assertIn('epub_document_open_failed', method)
+        self.assertIn('?: throw IOException("Document provider returned no input stream")', method)
+        self.assertIn('tempFile.delete()', method)
 
     def test_detail_holds_gate_from_path_resolution_through_persistence(self):
         detail = source('BookDetailActivity.kt')

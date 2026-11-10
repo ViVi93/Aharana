@@ -10,6 +10,8 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.vivi.aharana.R
+import com.vivi.aharana.DownloadWarnings
+import com.vivi.aharana.QueueJobPolicy
 import com.vivi.aharana.data.local.DownloadJobEntity
 
 class DownloadJobAdapter(
@@ -77,6 +79,7 @@ class DownloadJobAdapter(
             }
 
             // Status badge
+            val warnings = DownloadWarnings.parse(job.resultJson)
             val (statusText, statusColorRes, iconVisible) = when (job.status) {
                 "queued" -> Triple(
                     context.getString(R.string.status_queued),
@@ -104,7 +107,7 @@ class DownloadJobAdapter(
                     false
                 )
                 "success" -> Triple(
-                    context.getString(R.string.status_complete),
+                    warnings.completionMessage(context.getString(R.string.status_complete)),
                     R.color.fanficfare_secondary,
                     false
                 )
@@ -134,9 +137,15 @@ class DownloadJobAdapter(
             iconStatus.visibility = if (iconVisible) View.VISIBLE else View.GONE
 
             // Error
-            if (job.status == "failed" && !job.error.isNullOrBlank()) {
+            val failureReason = QueueJobPolicy.failureReason(job.status, job.error)
+            if (failureReason != null) {
                 textError.visibility = View.VISIBLE
-                textError.text = job.error
+                textError.text = failureReason
+            } else if (job.status == "success" && warnings.hasWarnings) {
+                textError.visibility = View.VISIBLE
+                textError.text = warnings.messages.joinToString("\n").ifBlank {
+                    warnings.completionMessage("EPUB saved")
+                }
             } else {
                 textError.visibility = View.GONE
             }

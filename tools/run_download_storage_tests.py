@@ -20,7 +20,8 @@ def main():
                  artifact('org.jetbrains', 'annotations', '13.0')]
     repo = Path(__file__).resolve().parents[1]
     production = repo / 'app/src/main/java/com/vivi/aharana'
-    sources = [production / 'LibraryEpubStorage.kt', repo / 'tests/LibraryDownloadStorageTest.kt']
+    sources = [production / 'LibraryEpubStorage.kt', production / 'StoryRefreshFiles.kt',
+               repo / 'tests/LibraryDownloadStorageTest.kt']
     gate = production / 'LibraryStorageGate.kt'
     if gate.exists():
         sources.append(gate)

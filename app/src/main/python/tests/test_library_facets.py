@@ -127,6 +127,96 @@ class LibraryFacetsTests(unittest.TestCase):
         os.remove(self.epub)
         self.assertEqual(expected, json.loads(fanficfare_bridge.get_library_facets(self.epub)))
 
+    def test_bridge_diagnostics_distinguish_real_read_failures_without_exposing_private_text(self):
+        import fanficfare_bridge
+        expected = {'ok': False, 'error': 'Saved book filters could not be read.'}
+        cases = [('missing', 'FileNotFoundError'), ('corrupt', 'BadZipFile'), ('xml', 'ParseError')]
+        for kind, exception_type in cases:
+            with self.subTest(kind=kind):
+                if os.path.exists(self.epub):
+                    os.remove(self.epub)
+                if kind == 'corrupt':
+                    with open(self.epub, 'wb') as stream:
+                        stream.write(b'PRIVATE_FIXTURE invalid zip')
+                elif kind == 'xml':
+                    with zipfile.ZipFile(self.epub, 'w') as archive:
+                        archive.writestr('book.opf', '<package>PRIVATE_FIXTURE broken XML')
+                with patch.object(fanficfare_bridge._diagnostics, 'emit') as emit:
+                    self.assertEqual(expected, json.loads(fanficfare_bridge.get_library_facets(self.epub)))
+                events = [call.kwargs for call in emit.call_args_list
+                          if call.args[0] == 'library_facets_read_failed']
+                self.assertTrue(events, 'The underlying read failure was silently discarded')
+                self.assertEqual(exception_type, events[0]['exception_type'])
+                self.assertNotIn('PRIVATE_FIXTURE', repr(events))
+                self.assertNotIn(self.epub, repr(events))
+
+    def test_story_reader_and_bridge_exceptions_reach_nonfatal_diagnostic_hook(self):
+        import fanficfare_bridge
+        expected = {'ok': False, 'error': 'Saved book filters could not be read.'}
+        self.fixture()
+        for target, error in (
+            ('story_metadata._explicit_status', ValueError('PRIVATE_FIXTURE')),
+            ('library_facets.get_library_facets', ImportError('PRIVATE_FIXTURE')),
+        ):
+            with self.subTest(target=target):
+                self.fixture(extra='<meta name="aharana:story:status" content="Paused"/>')
+                with patch(target, side_effect=error), patch.object(fanficfare_bridge._diagnostics, 'emit') as emit:
+                    self.assertEqual(expected, json.loads(fanficfare_bridge.get_library_facets(self.epub)))
+                events = [call.kwargs for call in emit.call_args_list
+                          if call.args[0] == 'library_facets_read_failed']
+                self.assertEqual(type(error).__name__, events[0]['exception_type'])
+                self.assertNotIn('PRIVATE_FIXTURE', repr(events))
+        with patch.object(fanficfare_bridge._diagnostics, 'emit', side_effect=RuntimeError('logger unavailable')):
+            os.remove(self.epub)
+            self.assertEqual(expected, json.loads(fanficfare_bridge.get_library_facets(self.epub)))
+
+    def test_real_jsonl_writer_retains_actual_cause_and_opaque_identity_without_private_text(self):
+        import fanficfare_bridge
+        diagnostics = fanficfare_bridge._diagnostics
+        expected = {'ok': False, 'error': 'Saved book filters could not be read.'}
+        cases = [('missing', 'FileNotFoundError', 'file_missing'),
+                 ('corrupt', 'BadZipFile', 'invalid_zip'), ('xml', 'ParseError', 'invalid_xml'),
+                 ('opf', 'ValueError', 'missing_opf'), ('metadata', 'ValueError', 'missing_metadata'),
+                 ('permission', 'PermissionError', 'permission_denied'),
+                 ('story', 'ValueError', 'metadata_read_failed'),
+                 ('import', 'ImportError', 'reader_import_failed')]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                diagnostics, '_directory', os.path.join(directory, 'diagnostics')):
+            for kind, exception_type, reason in cases:
+                with self.subTest(kind=kind), ExitStack() as stack:
+                    self.fixture(extra='<meta name="aharana:story:status" content="Paused"/>')
+                    if kind == 'missing':
+                        os.remove(self.epub)
+                    elif kind == 'corrupt':
+                        with open(self.epub, 'wb') as stream:
+                            stream.write(b'PRIVATE_FIXTURE invalid ZIP')
+                    elif kind in ('xml', 'opf', 'metadata'):
+                        with zipfile.ZipFile(self.epub, 'w') as archive:
+                            if kind == 'xml':
+                                archive.writestr('book.opf', '<package>PRIVATE_FIXTURE broken')
+                            elif kind == 'metadata':
+                                archive.writestr('book.opf', '<package/>')
+                            else:
+                                archive.writestr('mimetype', 'application/epub+zip')
+                    elif kind == 'permission':
+                        stack.enter_context(patch('library_facets.zipfile.ZipFile',
+                            side_effect=PermissionError(13, 'PRIVATE_FIXTURE', '/private/path')))
+                    elif kind == 'story':
+                        stack.enter_context(patch('story_metadata._explicit_status', side_effect=ValueError('PRIVATE_FIXTURE')))
+                    elif kind == 'import':
+                        stack.enter_context(patch('library_facets.get_library_facets', side_effect=ImportError('PRIVATE_FIXTURE')))
+                    self.assertEqual(expected, json.loads(fanficfare_bridge.get_library_facets(self.epub)))
+                    rows = [json.loads(line) for line in diagnostics.read().splitlines()]
+                    row = [entry for entry in rows if entry['event'] == 'library_facets_read_failed'][-1]
+                    self.assertEqual(exception_type, row.get('exception_type'))
+                    self.assertEqual(reason, row.get('reason'))
+                    self.assertEqual(hashlib.sha256(self.epub.encode('utf-8')).hexdigest()[:12], row.get('epub_key'))
+                    if kind == 'permission':
+                        self.assertEqual(13, row.get('errno'))
+                    self.assertNotIn('PRIVATE_FIXTURE', diagnostics.read())
+                    self.assertNotIn('/private/path', diagnostics.read())
+                    self.assertNotIn(self.epub, diagnostics.read())
+
     def test_extraction_is_offline_read_only_and_does_not_import_engine_or_config(self):
         import epub_editor
         import fanficfare_bridge

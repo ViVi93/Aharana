@@ -4,8 +4,37 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 
-/** Filesystem-only persistence for an existing book; never routes it via the output root. */
+/** Existing-book persistence; only explicit Force recovery may save a new fallback copy. */
 internal object LibraryEpubStorage {
+    /** Explicit Force may restore a missing book; normal Update still requires its old copy. */
+    fun saveForced(
+        source: File,
+        path: String,
+        replaceExisting: (File, String) -> String,
+        recoveryCopy: (File) -> String,
+        replaceAllowed: Boolean = true,
+        saveMissing: (File, File, String) -> String = { input, directory, name ->
+            StoryRefreshFiles.saveNewCopy(input, directory, name).absolutePath
+        }
+    ): String {
+        check(source.isFile && source.canRead() && source.length() > 0L) { "Generated EPUB is missing or empty; library entry was kept" }
+        if (path.isBlank()) return recoveryCopy(source)
+        try {
+            // Picked documents already use the established verified-new-copy route.
+            if (path.startsWith("content://") || (replaceAllowed && File(path).isFile)) return replaceExisting(source, path)
+            val target = File(path).absoluteFile
+            // Claim a missing filename without overwrite, including a late collision.
+            val directory = checkNotNull(target.parentFile) { "Cannot resolve the previous EPUB folder" }
+            return saveMissing(source, directory, target.name)
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Old folders may have disappeared or lost access. Keep them untouched and
+            // save a unique verified copy in the user's current output folder instead.
+            return recoveryCopy(source)
+        }
+    }
+
     /** Existing picked documents keep their original; only filesystem books replace in place. */
     fun saveExisting(source: File, path: String, replaceFile: (File, String) -> String,
                      saveDocumentCopy: (File) -> String): String =

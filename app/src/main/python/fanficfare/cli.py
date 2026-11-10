@@ -24,8 +24,9 @@ import logging
 import pprint
 import string
 import os, sys, platform
+from functools import partial
 
-version="4.62.0"
+version="4.63.0"
 os.environ['CURRENT_VERSION_ID']=version
 
 global_cache = 'global_cache'
@@ -42,8 +43,9 @@ logger = logging.getLogger('fanficfare')
 from fanficfare import adapters, writers, exceptions
 from fanficfare.configurable import Configuration
 from fanficfare.epubutils import (
-    get_dcsource_chaptercount, get_update_data, reset_orig_chapters_epub)
-from fanficfare.geturls import get_urls_from_page, get_urls_from_imap
+    get_dcsource_chaptercount, get_update_data, unnew_chapters_epub)
+from fanficfare.geturls import GetURLs
+from fanficfare.updategate import decide_update
 import configparser
 
 from fanficfare.fff_profile import do_cprofile
@@ -257,7 +259,8 @@ def dispatch(options, urls,
         configuration = get_configuration(options.list,
                                           passed_defaultsini,
                                           passed_personalini,options)
-        frompage = get_urls_from_page(options.list, configuration)
+        geturls = GetURLs(configuration)
+        frompage = geturls.get_urls_from_page(options.list)
         if options.jsonmeta:
             import json
             print(json.dumps(frompage, sort_keys=True,
@@ -270,28 +273,35 @@ def dispatch(options, urls,
         configuration = get_configuration(options.normalize,
                                           passed_defaultsini,
                                           passed_personalini,options)
-        retlist = get_urls_from_page(options.normalize, configuration,normalize=True).get('urllist',[])
+        geturls = GetURLs(configuration)
+        retlist = geturls.get_urls_from_page(options.normalize,normalize=True).get('urllist',[])
         print('\n'.join(retlist))
 
     if options.downloadlist:
         configuration = get_configuration(options.downloadlist,
                                           passed_defaultsini,
                                           passed_personalini,options)
-        retlist = get_urls_from_page(options.downloadlist, configuration).get('urllist',[])
+        geturls = GetURLs(configuration)
+        retlist = geturls.get_urls_from_page(options.downloadlist).get('urllist',[])
         urls.extend(retlist)
 
     if options.imaplist or options.downloadimap:
-        # list doesn't have a supported site.
+        # imap doesn't have a supported site.
         configuration = get_configuration('test1.com',passed_defaultsini,passed_personalini,options)
+        pass_get_config = partial(get_configuration,
+                                  passed_defaultsini=passed_defaultsini,
+                                  passed_personalini=passed_personalini,
+                                  options=options)
         markread = configuration.getConfig('imap_mark_read') == 'true' or \
             (configuration.getConfig('imap_mark_read') == 'downloadonly' and options.downloadimap)
         normalize_urls = configuration.getConfig('imap_normalize_urls') == 'true'
-        retlist = get_urls_from_imap(configuration.getConfig('imap_server'),
-                                     configuration.getConfig('imap_username'),
-                                     configuration.getConfig('imap_password'),
-                                     configuration.getConfig('imap_folder'),
-                                     markread,
-                                     normalize_urls)
+        geturls = GetURLs(configuration,pass_get_config)
+        retlist = geturls.get_urls_from_imap(configuration.getConfig('imap_server'),
+                                             configuration.getConfig('imap_username'),
+                                             configuration.getConfig('imap_password'),
+                                             configuration.getConfig('imap_folder'),
+                                             markread,
+                                             normalize_urls)
 
         if options.downloadimap:
             urls.extend(retlist)
@@ -357,7 +367,7 @@ def do_download(arg,
 
     if options.unnew:
         # remove mark_new_chapters marks
-        reset_orig_chapters_epub(arg,arg)
+        unnew_chapters_epub(arg,arg)
         return
 
     if options.update:
@@ -475,11 +485,18 @@ def do_download(arg,
             needs_edit_check = adapter.recheck_recent_chapters()
             preserve_deleted = adapter.preserve_deleted_chapters()
 
-            if chaptercount == urlchaptercount and not options.metaonly and not options.updatealways and not needs_edit_check:
+            update_decision = decide_update(chaptercount, urlchaptercount,
+                               metaonly=options.metaonly,
+                               updatealways=options.updatealways,
+                               needs_edit_check=needs_edit_check,
+                               preserve_deleted=preserve_deleted,
+                               force_update_epub_always=options.updatealways and adapter.getConfig('force_update_epub_always'))
+
+            if update_decision == 'already_contains':
                 print('%s already contains %d chapters.' % (output_filename, chaptercount))
-            elif chaptercount > urlchaptercount and not preserve_deleted and not (options.updatealways and adapter.getConfig('force_update_epub_always')):
+            elif update_decision == 'more_than_source':
                 warn('%s contains %d chapters, more than source: %d.' % (output_filename, chaptercount, urlchaptercount))
-            elif chaptercount == 0:
+            elif update_decision == 'no_chapters':
                 warn("%s doesn't contain any recognizable chapters, probably from a different source.  Not updating." % output_filename)
             else:
                 # update now handled by pre-populating the old
@@ -496,12 +513,22 @@ def do_download(arg,
                  adapter.oldchaptersdata) = (get_update_data(output_filename))[0:9]
 
                 if preserve_deleted and adapter.oldchaptersmap:
-                    site_urls = set(ch['url'] for ch in adapter.chapterUrls)
+                    site_urls = set(ch['url'] for ch in adapter.get_chapters())
                     preserved_count = sum(1 for old_url in adapter.oldchaptersmap
                                           if old_url not in site_urls)
                     if preserved_count:
                         print('Preserving %d chapters that are no longer on the source site.' % preserved_count)
 
+                # Fetch the story now (previously only inside write_story) so we
+                # can tell whether anything actually changed before committing a
+                # rewrite.  write_story guards against a second fetch once the
+                # story is loaded.
+                adapter.getStory()
+
+                # Android safety divergence: chapter counters alone cannot
+                # prove that titles, ordering, story metadata, images or
+                # preservation marks are unchanged. Do not discard those
+                # changes via upstream's counter-only post-fetch skip.
                 print('Do update - epub(%d) vs url(%d)' % (chaptercount, urlchaptercount))
 
                 if not update_story and chaptercount == urlchaptercount and adapter.getConfig('do_update_hook'):
@@ -582,9 +609,9 @@ def do_download(arg,
         fail(ad)
 
 def get_configuration(url,
-                      passed_defaultsini,
-                      passed_personalini,
-                      options,
+                      passed_defaultsini=None,
+                      passed_personalini=None,
+                      options={},
                       chaptercount=None,
                       output_filename=None):
     try:

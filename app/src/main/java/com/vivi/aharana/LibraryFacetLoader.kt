@@ -48,13 +48,22 @@ internal class LibraryFacetLoader private constructor(context: Context) {
             }, delete = { path ->
                 try { database.invalidate(path) }
                 catch (e: Exception) { DiagnosticLog.appendException(this.context, "LibraryFacetCache", "index_delete_failed", e) }
-            }, extract = ::extract)
+            }, extract = ::extract, replaceSnapshot = { entries ->
+                try { database.replaceSnapshot(entries.map {
+                    LibraryFacetIndexEntry(it.bookSignature, it.fileSignature, it.record)
+                }) } catch (e: Exception) {
+                    DiagnosticLog.appendException(this.context, "LibraryFacetCache", "snapshot_write_failed", e)
+                    throw e // Never publish/mark durable a failed transaction.
+                }
+            }, ioDispatcher = Dispatchers.IO)
     }
 
     /** One SQLite bulk read per process; no per-book source opens/stats on the startup path. */
-    suspend fun cached(books: List<BookItem>): Map<String, LibraryFacetRecord> = withContext(Dispatchers.IO) {
-        index.cached(books)
+    suspend fun cached(books: List<BookItem>, allowStale: Boolean = false): Map<String, LibraryFacetRecord> = withContext(Dispatchers.IO) {
+        index.cached(books, allowStale)
     }
+
+    suspend fun unreadable(books: List<BookItem>): Set<String> = withContext(Dispatchers.IO) { index.unreadable(books) }
 
     @Volatile private var membership: Set<String> = emptySet()
     fun setMembership(books: List<BookItem>) { membership = books.mapTo(hashSetOf()) { it.uriString } }
@@ -90,9 +99,14 @@ internal class LibraryFacetLoader private constructor(context: Context) {
         return "${file.exists()}:${file.length()}:${file.lastModified()}"
     }
 
+    /** Private per-refresh entries; only the coordinator's accepted commit advances the cache. */
+    fun beginRefresh(): LibraryFacetRefresh<BookItem> = index.beginRefresh()
+
     suspend fun read(book: BookItem, force: Boolean = false): Pair<LibraryFacetRecord, Boolean> =
         withContext(Dispatchers.IO) {
-            index.read(book, force)
+            // Visible-row status reads may consult sources, but only explicit filter
+            // refreshes replace the durable filter snapshot (including across restart).
+            index.read(book, force, cacheResult = false)
         }
 
     private suspend fun extract(book: BookItem): Pair<LibraryFacetRecord, Boolean> {
@@ -101,10 +115,10 @@ internal class LibraryFacetLoader private constructor(context: Context) {
         try {
             val raw = StorageBridge.withLocalEpub(context, book.uriString) {
                 bridge.getLibraryFacets(it.absolutePath)
-            } ?: error("Unreadable EPUB")
+            } ?: error("EPUB file is missing, inaccessible, or could not be opened")
             coroutineContext.ensureActive()
             val meta = JSONObject(raw)
-            check(meta.optBoolean("ok"))
+            check(meta.optBoolean("ok")) { "EPUB metadata read failed: ${meta.optString("error", "unknown error").take(240)}" }
             for (key in listOf("authors", "languages", "series", "tags")) {
                 val array = meta.optJSONArray(key) ?: JSONArray()
                 val values = (0 until array.length()).map { array.optString(it).trim() }.filter { it.isNotBlank() }.toSet()
@@ -115,7 +129,9 @@ internal class LibraryFacetLoader private constructor(context: Context) {
             return LibraryFacetRecord(book.uriString, base.toMap()) to true
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            DiagnosticLog.appendException(context, "LibraryFilters",
+                "metadata_read_failed book=${book.libraryId} title=${book.title.take(120)} source=${book.uriString.take(512)}", e)
             for (key in listOf("status", "site", "languages", "series", "tags")) base[key] = setOf("(Unreadable)")
             return LibraryFacetRecord(book.uriString, base.toMap()) to false
         }
